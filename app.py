@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from pathlib import Path
 from typing import Iterable, Callable
+import re
 
 import folium
 import geopandas as gpd
@@ -25,6 +26,7 @@ GRAPHML_PATH = Path("cache/ehime_drive.graphml")
 GRAPHML_PATH.parent.mkdir(parents=True, exist_ok=True)
 STATIONS_DB_PATH = Path("map.sqlite")
 ISOCHRONE_CACHE_PATH = Path("cache/isochrones.parquet")
+GEOCODE_CACHE_PATH = Path("cache/incident_geocode.parquet")
 
 
 def graph_data_version() -> float:
@@ -37,6 +39,57 @@ def station_data_version(db_path: Path = STATIONS_DB_PATH, excel_path: str = "ma
     if db_path.exists():
         return db_path.stat().st_mtime
     return Path(excel_path).stat().st_mtime if Path(excel_path).exists() else 0.0
+
+
+@st.cache_data(show_spinner=False)
+def load_incident_data(excel_path: str = "R6.xlsx") -> pd.DataFrame:
+    """Load incident records; keeps only rows with a valid 発生日時."""
+    if not Path(excel_path).exists():
+        raise FileNotFoundError(excel_path)
+    df = pd.read_excel(excel_path)
+    df["覚知"] = pd.to_datetime(df["覚知"], errors="coerce")
+    df = df[df["覚知"].notna()].copy()
+    df["date"] = df["覚知"].dt.date
+    return df
+
+
+def _load_geocode_cache(path: Path = GEOCODE_CACHE_PATH) -> pd.DataFrame:
+    if path.exists():
+        try:
+            return pd.read_parquet(path)
+        except Exception:
+            return pd.DataFrame(columns=["address", "lat", "lon"])
+    return pd.DataFrame(columns=["address", "lat", "lon"])
+
+
+def _save_geocode_cache(df: pd.DataFrame, path: Path = GEOCODE_CACHE_PATH) -> None:
+    try:
+        df.to_parquet(path, index=False)
+    except Exception:
+        pass
+
+
+def geocode_addresses(addresses: list[str], region_prefix: str = "愛媛県") -> pd.DataFrame:
+    """Geocode addresses with osmnx + Nominatim and persist results locally."""
+    cache = _load_geocode_cache().copy()
+    seen = set(cache["address"].tolist())
+    missing = [a for a in addresses if a not in seen]
+
+    new_records: list[dict] = []
+    for addr in missing:
+        query = f"{region_prefix} {addr}" if region_prefix else addr
+        try:
+            lat, lon = ox.geocode(query)
+            new_records.append({"address": addr, "lat": lat, "lon": lon})
+        except Exception:
+            new_records.append({"address": addr, "lat": None, "lon": None})
+
+    if new_records:
+        cache = pd.concat([cache, pd.DataFrame(new_records)], ignore_index=True)
+        cache = cache.drop_duplicates(subset=["address"], keep="last")
+        _save_geocode_cache(cache)
+
+    return cache[cache["address"].isin(addresses)].copy()
 
 
 @st.cache_data(show_spinner=False)
@@ -237,8 +290,8 @@ def render_map_html(
 
 def main() -> None:
     st.set_page_config(page_title="愛媛救急車 到達圏ビューア", layout="wide")
-    st.title("🚑 愛媛県 救急車到達圏ビューア")
-    st.caption("map.xlsx を元に消防署の到達圏を可視化します。")
+    st.title("🚑 愛媛県 救急車ビューア")
+    st.caption("map.xlsx で拠点到達圏、R6.xlsx で出動地点を可視化します。")
 
     stations = load_station_data(
         db_path=STATIONS_DB_PATH,
@@ -249,91 +302,165 @@ def main() -> None:
     if "virtual_stations" not in st.session_state:
         st.session_state["virtual_stations"] = []
 
-    with st.expander("仮想消防署を追加（このセッションのみ）"):
-        with st.form("virtual_station_form"):
-            default_name = f"仮想署{len(st.session_state['virtual_stations']) + 1}"
-            v_name = st.text_input("略称", value=default_name)
-            v_lat = st.number_input("緯度", value=float(stations["緯度"].mean()))
-            v_lon = st.number_input("経度", value=float(stations["経度"].mean()))
-            submitted = st.form_submit_button("追加")
-            if submitted:
-                st.session_state["virtual_stations"].append({
-                    "略称": v_name.strip() or default_name,
-                    "緯度": v_lat,
-                    "経度": v_lon,
-                })
-                st.success(f"仮想消防署を追加: {v_name}")
-        if st.button("仮想消防署をクリア", type="secondary"):
-            st.session_state["virtual_stations"] = []
-            st.info("仮想消防署をクリアしました。")
+    tab_iso, tab_inc = st.tabs(["到達圏", "出動地点 (R6)" ])
 
-    has_virtual = bool(st.session_state["virtual_stations"])
-    stations = append_virtual_stations(stations, st.session_state["virtual_stations"])
-    stations_plain = stations.drop(columns="geometry").copy()
-    station_names = sorted(stations["略称"].unique())
-    trip_options = [5, 10, 15, 20]
+    with tab_iso:
+        with st.expander("仮想消防署を追加（このセッションのみ）"):
+            with st.form("virtual_station_form"):
+                default_name = f"仮想署{len(st.session_state['virtual_stations']) + 1}"
+                v_name = st.text_input("略称", value=default_name)
+                v_lat = st.number_input("緯度", value=float(stations["緯度"].mean()))
+                v_lon = st.number_input("経度", value=float(stations["経度"].mean()))
+                submitted = st.form_submit_button("追加")
+                if submitted:
+                    st.session_state["virtual_stations"].append({
+                        "略称": v_name.strip() or default_name,
+                        "緯度": v_lat,
+                        "経度": v_lon,
+                    })
+                    st.success(f"仮想消防署を追加: {v_name}")
+            if st.button("仮想消防署をクリア", type="secondary"):
+                st.session_state["virtual_stations"] = []
+                st.info("仮想消防署をクリアしました。")
 
-    col_left, col_right = st.columns([2, 1])
-    with col_left:
-        selected_names = st.multiselect(
-            "表示する消防署",
-            options=station_names,
-            default=station_names,
-            help="複数選択で到達圏を比較できます。",
-        )
-    with col_right:
-        selected_times = st.multiselect(
-            "到達時間 (分)",
-            options=trip_options,
-            default=[5, 10],
-        )
+        has_virtual = bool(st.session_state["virtual_stations"])
+        stations_view = append_virtual_stations(stations, st.session_state["virtual_stations"])
+        station_names = sorted(stations_view["略称"].unique())
+        trip_options = [5, 10, 15, 20]
 
-    if not selected_names:
-        st.warning("少なくとも1つの消防署を選択してください。")
-        st.stop()
-    if not selected_times:
-        st.warning("少なくとも1つの到達時間を選択してください。")
-        st.stop()
-
-    filtered = stations[stations["略称"].isin(selected_names)].copy()
-
-    padding_deg = 0.1
-    west_all, south_all, east_all, north_all = stations.total_bounds
-    bbox = (north_all + padding_deg, south_all - padding_deg, east_all + padding_deg, west_all - padding_deg)
-
-    with st.spinner("道路ネットワークを読み込み中..."):
-        graph = load_graph_cached(bbox)
-
-    if ISOCHRONE_CACHE_PATH.exists() and not has_virtual:
-        try:
-            with st.spinner("到達圏キャッシュを読み込み中..."):
-                all_isochrones = load_precomputed_isochrones(ISOCHRONE_CACHE_PATH)
-            display_isochrones = all_isochrones[
-                (all_isochrones["name"].isin(selected_names)) &
-                (all_isochrones["time"].isin(selected_times))
-            ].copy()
-        except Exception as exc:
-            st.warning(f"事前計算キャッシュの読み込みに失敗したため再計算します: {exc}")
-            display_isochrones = None
-    else:
-        display_isochrones = None
-
-    if display_isochrones is None:
-        with st.spinner("到達圏を計算しています..."):
-            prog = st.progress(0)
-            display_isochrones = compute_isochrones(
-                graph=graph,
-                stations=filtered,
-                trip_times=selected_times,
-                progress_cb=lambda p: prog.progress(int(p * 100)),
+        col_left, col_right = st.columns([2, 1])
+        with col_left:
+            selected_names = st.multiselect(
+                "表示する消防署",
+                options=station_names,
+                default=station_names,
+                help="複数選択で到達圏を比較できます。",
+            )
+        with col_right:
+            selected_times = st.multiselect(
+                "到達時間 (分)",
+                options=trip_options,
+                default=[5, 10],
             )
 
-    if display_isochrones.empty:
-        st.error("選択条件に合致する到達圏がありません。")
-        st.stop()
+        if not selected_names:
+            st.warning("少なくとも1つの消防署を選択してください。")
+            st.stop()
+        if not selected_times:
+            st.warning("少なくとも1つの到達時間を選択してください。")
+            st.stop()
 
-    html_map = render_map_html(display_isochrones, filtered)
-    st.components.v1.html(html_map, height=720)
+        filtered = stations_view[stations_view["略称"].isin(selected_names)].copy()
+
+        padding_deg = 0.1
+        west_all, south_all, east_all, north_all = stations_view.total_bounds
+        bbox = (north_all + padding_deg, south_all - padding_deg, east_all + padding_deg, west_all - padding_deg)
+
+        with st.spinner("道路ネットワークを読み込み中..."):
+            graph = load_graph_cached(bbox)
+
+        if ISOCHRONE_CACHE_PATH.exists() and not has_virtual:
+            try:
+                with st.spinner("到達圏キャッシュを読み込み中..."):
+                    all_isochrones = load_precomputed_isochrones(ISOCHRONE_CACHE_PATH)
+                display_isochrones = all_isochrones[
+                    (all_isochrones["name"].isin(selected_names)) &
+                    (all_isochrones["time"].isin(selected_times))
+                ].copy()
+            except Exception as exc:
+                st.warning(f"事前計算キャッシュの読み込みに失敗したため再計算します: {exc}")
+                display_isochrones = None
+        else:
+            display_isochrones = None
+
+        if display_isochrones is None:
+            with st.spinner("到達圏を計算しています..."):
+                prog = st.progress(0)
+                display_isochrones = compute_isochrones(
+                    graph=graph,
+                    stations=filtered,
+                    trip_times=selected_times,
+                    progress_cb=lambda p: prog.progress(int(p * 100)),
+                )
+
+        if display_isochrones.empty:
+            st.error("選択条件に合致する到達圏がありません。")
+            st.stop()
+
+        html_map = render_map_html(display_isochrones, filtered)
+        st.components.v1.html(html_map, height=720)
+
+    with tab_inc:
+        try:
+            incidents = load_incident_data("R6.xlsx")
+        except FileNotFoundError:
+            st.error("R6.xlsx が見つかりません。ルートに配置してください。")
+            st.stop()
+
+        date_options = sorted(incidents["date"].unique())
+        if not date_options:
+            st.warning("R6.xlsx に日付データがありません。")
+            st.stop()
+
+        default_date = date_options[0]
+        selected_date = st.selectbox(
+            "表示する日付 (覚知日)",
+            options=date_options,
+            format_func=lambda d: d.strftime("%Y-%m-%d"),
+            index=0,
+        )
+
+        day_inc = incidents[incidents["date"] == selected_date].copy()
+        addr_series = day_inc["出動場所"].dropna().astype(str)
+        addr_unique = sorted(addr_series.unique())
+
+        st.write(f"{selected_date} の出動件数: {len(day_inc)} 件 (ユニーク地点 {len(addr_unique)} 箇所)")
+
+        with st.spinner("住所をジオコーディングしています (キャッシュ利用) ..."):
+            geo_df = geocode_addresses(addr_unique, region_prefix="愛媛県")
+
+        merged = day_inc.merge(geo_df, left_on="出動場所", right_on="address", how="left")
+        mapped = merged.dropna(subset=["lat", "lon"]).copy()
+        missing_count = len(day_inc) - len(mapped)
+
+        if mapped.empty:
+            st.error("この日の地点をジオコーディングできませんでした。")
+            st.stop()
+
+        st.write(f"地図にプロットできた件数: {len(mapped)} / {len(day_inc)} (未特定 {missing_count} 件)")
+
+        center_lat = mapped["lat"].mean()
+        center_lon = mapped["lon"].mean()
+        fmap = folium.Map(location=[center_lat, center_lon], zoom_start=12, tiles="CartoDB Positron")
+
+        # Softer color by weekday to help visually group clusters
+        weekday_colors = {
+            "月": "#f94144",
+            "火": "#f3722c",
+            "水": "#f9c74f",
+            "木": "#90be6d",
+            "金": "#43aa8b",
+            "土": "#577590",
+            "日": "#9d4edd",
+        }
+
+        for _, row in mapped.iterrows():
+            wk = str(row.get("曜日", "?"))
+            color = weekday_colors.get(wk, "#4a4a4a")
+            label_time = row["覚知"].strftime("%H:%M") if not pd.isna(row.get("覚知")) else "--:--"
+            popup = f"{row.get('出動隊', '不明')} | {label_time} | {row.get('搬送区分(事案)', '')}"
+            folium.CircleMarker(
+                location=[row["lat"], row["lon"]],
+                radius=5,
+                color=color,
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.85,
+                weight=1.0,
+                popup=popup,
+            ).add_to(fmap)
+
+        st.components.v1.html(fmap.get_root().render(), height=720)
 
     st.info("アプリを終了するには、実行中のターミナルで Ctrl+C を押してください。")
 

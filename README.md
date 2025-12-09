@@ -124,6 +124,22 @@ python simulate_departures.py --date 2024-01-01 --show
 
 出動重複があっても同じ車両が同時に走らないよう、先行ジョブが終わるまで開始時刻を順送りにしています。
 
+### 4. R6の出動地点を事前ジオコーディングする
+
+地図描画を速くするため、R6.xlsx の出動場所をまとめてジオコーディングしてキャッシュできます。
+
+```bash
+# すべての出動場所をキャッシュ (Nominatimへの負荷を考慮して1秒スリープ)
+python scripts/precompute_incident_geocode.py --input R6.xlsx --output cache/incident_geocode.parquet --sleep 1.0
+
+# まず100件だけ試す場合
+python scripts/precompute_incident_geocode.py --input R6.xlsx --limit 100
+```
+
+- `--region` で住所の前に付ける地域名を指定（既定: 愛媛県）
+- `--sleep` でリクエスト間隔を秒で指定（既定: 1.0。Nominatimのレート制限配慮）
+- `--limit` で新規ジオコーディング件数を上限指定（再実行やデバッグ用）
+
 ## ファイル構成
 
 - `app.py`: Streamlit Webアプリケーションのメインスクリプト
