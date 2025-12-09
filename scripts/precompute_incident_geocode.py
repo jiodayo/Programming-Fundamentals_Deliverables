@@ -60,16 +60,30 @@ def load_cache(path: Path) -> pd.DataFrame:
 
 def geocode_missing(addresses: Iterable[str], region: str, sleep_sec: float) -> pd.DataFrame:
     records: list[dict] = []
+    total = len(list(addresses))
+    # Re-materialize iterator so we can iterate twice for counting and processing
+    addresses = list(addresses)
+    if total == 0:
+        return pd.DataFrame(columns=["address", "lat", "lon"])
+
+    bar_width = 28
+    def _update_bar(done: int) -> None:
+        frac = done / total
+        filled = int(bar_width * frac)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        print(f"\r[{bar}] {done}/{total}", end="")
+
     for idx, addr in enumerate(addresses, start=1):
         query = f"{region} {addr}" if region else addr
         try:
             lat, lon = ox.geocode(query)
             records.append({"address": addr, "lat": lat, "lon": lon})
-            print(f"[{idx}] OK {addr} -> ({lat:.6f}, {lon:.6f})")
         except Exception as exc:
-            print(f"[{idx}] FAIL {addr}: {exc}")
             records.append({"address": addr, "lat": None, "lon": None})
+        _update_bar(idx)
         time.sleep(max(0.0, sleep_sec))
+
+    print()  # newline after bar
     return pd.DataFrame(records)
 
 

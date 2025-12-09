@@ -51,6 +51,7 @@ python scripts/import_map_to_db.py --input map.xlsx --output map.sqlite
 
 - 変換後は `map.sqlite` を優先的に読み込み、存在しない場合のみ `map.xlsx` を参照します。
 - 元データの共有ポリシー上、`map.sqlite` もリポジトリには含めません。
+- 以降の全ての工程において、絶対にキャッシュしたほうがいいです。
 
 ### 道路ネットワーク取得を事前キャッシュする
 
@@ -127,6 +128,7 @@ python simulate_departures.py --date 2024-01-01 --show
 ### 4. R6の出動地点を事前ジオコーディングする
 
 地図描画を速くするため、R6.xlsx の出動場所をまとめてジオコーディングしてキャッシュできます。
+ちなみにキャッシュは絶対に作ったほうがいいです。
 
 ```bash
 # すべての出動場所をキャッシュ (Nominatimへの負荷を考慮して1秒スリープ)
