@@ -56,17 +56,28 @@ def load_station_data(
 def load_graph_cached(bbox: tuple[float, float, float, float]) -> nx.MultiDiGraph:
     north, south, east, west = bbox
     if GRAPHML_PATH.exists():
-        return ox.load_graphml(GRAPHML_PATH)
+        graph = ox.load_graphml(GRAPHML_PATH)
+    else:
+        print("道路データを準備中...（初回取得は時間がかかります）")
+        try:
+            graph = ox.graph_from_bbox(bbox=bbox, network_type="drive")
+        except ValueError as exc:
+            if "no graph nodes" not in str(exc).lower():
+                raise
+            graph = ox.graph_from_place("Ehime, Japan", network_type="drive")
+        ox.save_graphml(graph, GRAPHML_PATH)
 
-    print("道路データを準備中...（初回取得は時間がかかります）")
-    try:
-        graph = ox.graph_from_bbox(bbox=bbox, network_type="drive")
-    except ValueError as exc:
-        if "no graph nodes" not in str(exc).lower():
-            raise
-        graph = ox.graph_from_place("Ehime, Japan", network_type="drive")
+    if "travel_time" not in next(iter(graph.edges(data=True)))[2]:
+        graph = ox.add_edge_speeds(graph, hwy_speeds={
+            "residential": 30,
+            "secondary": 40,
+            "tertiary": 40,
+            "primary": 50,
+            "motorway": 80,
+        })
+        graph = ox.add_edge_travel_times(graph)
+        ox.save_graphml(graph, GRAPHML_PATH)
 
-    ox.save_graphml(graph, GRAPHML_PATH)
     return graph
 
 
@@ -109,14 +120,6 @@ def precompute_isochrones(
     stations = gpd.GeoDataFrame(station_df, geometry=geometry, crs="EPSG:4326")
 
     graph = ox.load_graphml(GRAPHML_PATH)
-    graph = ox.add_edge_speeds(graph, hwy_speeds={
-        "residential": 30,
-        "secondary": 40,
-        "tertiary": 40,
-        "primary": 50,
-        "motorway": 80,
-    })
-    graph = ox.add_edge_travel_times(graph)
     return compute_isochrones(graph, stations, trip_times)
 
 

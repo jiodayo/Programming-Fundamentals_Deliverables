@@ -164,14 +164,16 @@ def main() -> None:
     west -= padding_deg
 
     graph = load_or_build_graph(north=north, south=south, east=east, west=west)
-    graph = ox.add_edge_speeds(graph, hwy_speeds={
-        "residential": 30,
-        "secondary": 40,
-        "tertiary": 40,
-        "primary": 50,
-        "motorway": 80,
-    })
-    graph = ox.add_edge_travel_times(graph)
+    if "travel_time" not in next(iter(graph.edges(data=True)))[2]:
+        graph = ox.add_edge_speeds(graph, hwy_speeds={
+            "residential": 30,
+            "secondary": 40,
+            "tertiary": 40,
+            "primary": 50,
+            "motorway": 80,
+        })
+        graph = ox.add_edge_travel_times(graph)
+        ox.save_graphml(graph, GRAPHML_PATH)
 
     trip_times = [5, 10]
     isochrones = compute_isochrones(graph, stations, trip_times)

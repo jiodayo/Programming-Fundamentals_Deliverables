@@ -54,7 +54,18 @@ python scripts/import_map_to_db.py --input map.xlsx --output map.sqlite
 - 変換後は `map.sqlite` を優先的に読み込み、存在しない場合のみ `map.xlsx` を参照します。
 - 元データの共有ポリシー上、`map.sqlite` もリポジトリには含めません。
 
-利用規約の都合でこのリポジトリにはあげないです。Teamsにて共有しています。
+### 道路ネットワーク取得を事前キャッシュする
+
+初回の道路ネットワーク取得が重い場合は、GraphMLを事前生成してキャッシュできます。
+
+```bash
+python scripts/precache_graph.py --source map.sqlite --fallback map.xlsx --output cache/ehime_drive.graphml
+```
+
+- 一度作成した `cache/ehime_drive.graphml` を再利用することで、`app.py` / `generate_map.py` の起動が高速化されます。
+- GraphMLには速度・到達時間属性を保存するため、再計算を省略できます。
+
+利用規約の都合でmap.xlsxはこのリポジトリにはあげないです。Teamsにて共有しています。
 
 ## 使い方
 
