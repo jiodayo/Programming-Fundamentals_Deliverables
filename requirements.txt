@@ -1,0 +1,10 @@
+streamlit
+folium
+geopandas
+networkx
+osmnx
+pandas
+shapely
+matplotlib
+japanize-matplotlib
+openpyxl
