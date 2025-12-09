@@ -48,7 +48,13 @@ def download_and_cache_graph(stations: gpd.GeoDataFrame, output: Path) -> None:
 
     output.parent.mkdir(parents=True, exist_ok=True)
     print("Downloading road network (may take a while on first run)...")
-    graph = ox.graph_from_bbox(north=north, south=south, east=east, west=west, network_type="drive")
+    try:
+        graph = ox.graph_from_bbox((north, south, east, west), network_type="drive")
+    except ValueError as exc:
+        if "no graph nodes" not in str(exc).lower():
+            raise
+        print("指定範囲に道路ノードが見つからなかったため、愛媛県全域データにフォールバックします。")
+        graph = ox.graph_from_place("Ehime, Japan", network_type="drive")
 
     # Store speed and travel time so runtime doesn’t have to recompute.
     graph = ox.add_edge_speeds(graph, hwy_speeds={
