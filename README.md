@@ -62,6 +62,17 @@ python scripts/precache_graph.py --source map.sqlite --fallback map.xlsx --outpu
 - 一度作成した `cache/ehime_drive.graphml` を再利用することで、`app.py` / `generate_map.py` の起動が高速化されます。
 - GraphMLには速度・到達時間属性を保存するため、再計算を省略できます。
 
+### 到達圏を事前計算して即時表示したい場合
+
+全消防署×時間帯をバッチで計算し、Parquetにキャッシュできます。
+
+```bash
+python scripts/precompute_isochrones.py --times 5 10 15 20 --source map.sqlite --fallback map.xlsx --graph cache/ehime_drive.graphml --output cache/isochrones.parquet
+```
+
+- `cache/isochrones.parquet` が存在すれば、`app.py` / `generate_map.py` は計算をスキップして即表示します。
+- 時間帯を増減する場合は `--times` を変更して再生成してください。
+
 ### まとめて実行するスクリプト
 
 よく使う処理をまとめた実行スクリプトを用意しています。
@@ -102,4 +113,4 @@ python generate_map.py
 - `cache/`: 取得した道路ネットワークデータが保存されるディレクトリ（自動生成）
 
 ## メモ
-- `2025/12/09`: 作成したものを一旦アップロード
+- `2025/12/09`: 作成したものを一旦アップロード、高速化したら地図が表示されなくなったので修正予定

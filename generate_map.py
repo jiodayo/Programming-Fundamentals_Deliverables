@@ -12,11 +12,13 @@ import networkx as nx
 import osmnx as ox
 import pandas as pd
 from shapely.geometry import Point, MultiPoint
+ISOCHRONE_CACHE_PATH = Path("cache/isochrones.parquet")
 
 ox.settings.use_cache = True
 GRAPHML_PATH = Path("cache/ehime_drive.graphml")
 GRAPHML_PATH.parent.mkdir(parents=True, exist_ok=True)
 STATIONS_DB_PATH = Path("map.sqlite")
+ISOCHRONE_CACHE_PATH = Path("cache/isochrones.parquet")
 
 
 def load_or_build_graph(north: float, south: float, east: float, west: float) -> nx.MultiDiGraph:
@@ -103,6 +105,11 @@ def load_stations(db_path: Path = STATIONS_DB_PATH, excel_path: str = "map.xlsx"
     geometry = gpd.points_from_xy(df["経度"], df["緯度"])
     return gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
 
+def load_precomputed_isochrones(path: Path = ISOCHRONE_CACHE_PATH) -> gpd.GeoDataFrame:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return gpd.read_parquet(path)
+
 
 def render_map(
     isochrones: gpd.GeoDataFrame,
@@ -115,7 +122,7 @@ def render_map(
     center_lon = stations["経度"].mean()
     fmap = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles=tiles)
 
-    color_map = {5: "#ff6b6b", 10: "#4361ee"}
+    color_map = {5: "#ff9e9e", 10: "#8aa5ff"}
     for minutes, color in color_map.items():
         layer = isochrones[isochrones["time"] == minutes]
         if layer.empty:
@@ -127,9 +134,9 @@ def render_map(
             style_function=lambda _feature, c=color, m=minutes: {
                 "fillColor": c,
                 "color": c,
-                "weight": 1.2,
-                "opacity": 0.8,
-                "fillOpacity": 0.25 if m == 10 else 0.45,
+                "weight": 1.0,
+                "opacity": 0.6,
+                "fillOpacity": 0.18 if m == 10 else 0.30,
             },
             tooltip=folium.GeoJsonTooltip(fields=["name", "time"], aliases=["拠点", "到達時間(分)"]),
         ).add_to(fmap)
@@ -204,22 +211,35 @@ def main() -> None:
     east += padding_deg
     west -= padding_deg
 
-    graph = load_or_build_graph(north=north, south=south, east=east, west=west)
-    if "travel_time" not in next(iter(graph.edges(data=True)))[2]:
-        graph = ox.add_edge_speeds(graph, hwy_speeds={
-            "residential": 30,
-            "secondary": 40,
-            "tertiary": 40,
-            "primary": 50,
-            "motorway": 80,
-        })
-        graph = ox.add_edge_travel_times(graph)
-        ox.save_graphml(graph, GRAPHML_PATH)
+    # Prefer precomputed cache when available
+    if ISOCHRONE_CACHE_PATH.exists():
+        try:
+            print("事前計算キャッシュを読み込み中...")
+            isochrones_all = load_precomputed_isochrones()
+            isochrones = isochrones_all[isochrones_all["time"].isin([5, 10])].copy()
+        except Exception as exc:
+            print(f"キャッシュ読み込みに失敗したため再計算します: {exc}")
+            isochrones = None
+    else:
+        isochrones = None
 
-    trip_times = [5, 10]
-    print("到達圏を計算中...")
-    progress = _make_progress_printer(len(stations))
-    isochrones = compute_isochrones(graph, stations, trip_times, progress_cb=progress)
+    if isochrones is None or isochrones.empty:
+        graph = load_or_build_graph(north=north, south=south, east=east, west=west)
+        if "travel_time" not in next(iter(graph.edges(data=True)))[2]:
+            graph = ox.add_edge_speeds(graph, hwy_speeds={
+                "residential": 30,
+                "secondary": 40,
+                "tertiary": 40,
+                "primary": 50,
+                "motorway": 80,
+            })
+            graph = ox.add_edge_travel_times(graph)
+            ox.save_graphml(graph, GRAPHML_PATH)
+
+        trip_times = [5, 10]
+        print("到達圏を計算中...")
+        progress = _make_progress_printer(len(stations))
+        isochrones = compute_isochrones(graph, stations, trip_times, progress_cb=progress)
     render_map(isochrones, stations, output_html=Path(args.output))
 
 

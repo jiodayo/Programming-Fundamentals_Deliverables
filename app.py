@@ -6,7 +6,7 @@ $ streamlit run app.py で実行
 from __future__ import annotations
 
 import sqlite3
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 from pathlib import Path
 from typing import Iterable, Callable
@@ -24,6 +24,7 @@ ox.settings.use_cache = True
 GRAPHML_PATH = Path("cache/ehime_drive.graphml")
 GRAPHML_PATH.parent.mkdir(parents=True, exist_ok=True)
 STATIONS_DB_PATH = Path("map.sqlite")
+ISOCHRONE_CACHE_PATH = Path("cache/isochrones.parquet")
 
 
 def graph_data_version() -> float:
@@ -109,7 +110,7 @@ def compute_isochrones(
     max_radius = trip_times_sorted[-1] * 60 if trip_times_sorted else 0
 
     def _one_station(payload: tuple[int, tuple]) -> list[dict]:
-        idx, (row, center_node) = payload
+        _idx, (row, center_node) = payload
         out: list[dict] = []
 
         # Single-source Dijkstra once up to the maximum requested time
@@ -131,13 +132,19 @@ def compute_isochrones(
             hull = MultiPoint(points).convex_hull
             out.append({"name": row.略称, "time": minutes, "geometry": hull})
 
-        if progress_cb:
-            progress_cb((idx + 1) / total)
         return out
 
     with ThreadPoolExecutor(max_workers=min(8, max(2, os.cpu_count() or 2))) as ex:  # type: ignore[name-defined]
-        for chunk in ex.map(_one_station, enumerate(zip(stations.itertuples(index=False), center_nodes))):
-            records.extend(chunk)
+        futures = [
+            ex.submit(_one_station, payload)
+            for payload in enumerate(zip(stations.itertuples(index=False), center_nodes))
+        ]
+        completed = 0
+        for fut in as_completed(futures):
+            records.extend(fut.result())
+            completed += 1
+            if progress_cb:
+                progress_cb(completed / total)
 
     if not records:
         raise RuntimeError("到達圏ポリゴンを生成できませんでした。条件を見直してください。")
@@ -158,6 +165,13 @@ def precompute_isochrones(
     return compute_isochrones(graph, stations, trip_times)
 
 
+@st.cache_data(show_spinner=False)
+def load_precomputed_isochrones(path: Path) -> gpd.GeoDataFrame:
+    if not path.exists():
+        raise FileNotFoundError(path)
+    return gpd.read_parquet(path)
+
+
 def render_map_html(
     isochrones: gpd.GeoDataFrame,
     stations: gpd.GeoDataFrame,
@@ -167,7 +181,8 @@ def render_map_html(
     center_lon = stations["経度"].mean()
     fmap = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles=tiles)
 
-    color_map = {5: "#ff6b6b", 10: "#4361ee", 15: "#2ec4b6", 20: "#f4a261"}
+    # Softer palette for better visibility when overlapping
+    color_map = {5: "#ff9e9e", 10: "#8aa5ff", 15: "#7dd8c6", 20: "#f7caa0"}
     for minutes in sorted({*isochrones["time"]}):
         layer = isochrones[isochrones["time"] == minutes]
         if layer.empty:
@@ -179,9 +194,9 @@ def render_map_html(
             style_function=lambda _feature, c=color, m=minutes: {
                 "fillColor": c,
                 "color": c,
-                "weight": 1.2,
-                "opacity": 0.8,
-                "fillOpacity": 0.25 if m >= 10 else 0.45,
+                "weight": 1.0,
+                "opacity": 0.6,
+                "fillOpacity": 0.18 if m >= 10 else 0.30,
             },
             tooltip=folium.GeoJsonTooltip(fields=["name", "time"], aliases=["拠点", "到達時間(分)"])
         ).add_to(fmap)
@@ -247,14 +262,29 @@ def main() -> None:
     with st.spinner("道路ネットワークを読み込み中..."):
         graph = load_graph_cached(bbox)
 
-    with st.spinner("到達圏を計算しています..."):
-        prog = st.progress(0)
-        display_isochrones = compute_isochrones(
-            graph=graph,
-            stations=filtered,
-            trip_times=selected_times,
-            progress_cb=lambda p: prog.progress(int(p * 100)),
-        )
+    if ISOCHRONE_CACHE_PATH.exists():
+        try:
+            with st.spinner("到達圏キャッシュを読み込み中..."):
+                all_isochrones = load_precomputed_isochrones(ISOCHRONE_CACHE_PATH)
+            display_isochrones = all_isochrones[
+                (all_isochrones["name"].isin(selected_names)) &
+                (all_isochrones["time"].isin(selected_times))
+            ].copy()
+        except Exception as exc:
+            st.warning(f"事前計算キャッシュの読み込みに失敗したため再計算します: {exc}")
+            display_isochrones = None
+    else:
+        display_isochrones = None
+
+    if display_isochrones is None:
+        with st.spinner("到達圏を計算しています..."):
+            prog = st.progress(0)
+            display_isochrones = compute_isochrones(
+                graph=graph,
+                stations=filtered,
+                trip_times=selected_times,
+                progress_cb=lambda p: prog.progress(int(p * 100)),
+            )
 
     if display_isochrones.empty:
         st.error("選択条件に合致する到達圏がありません。")
