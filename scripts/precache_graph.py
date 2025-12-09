@@ -14,6 +14,7 @@ Notes:
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import geopandas as gpd
@@ -56,6 +57,7 @@ def download_and_cache_graph(stations: gpd.GeoDataFrame, output: Path) -> None:
         print("指定範囲に道路ノードが見つからなかったため、愛媛県全域データにフォールバックします。")
         graph = ox.graph_from_place("Ehime, Japan", network_type="drive")
 
+    sys.stdout.write("速度・時間属性を付与中...\n")
     # Store speed and travel time so runtime doesn’t have to recompute.
     graph = ox.add_edge_speeds(graph, hwy_speeds={
         "residential": 30,
@@ -66,6 +68,7 @@ def download_and_cache_graph(stations: gpd.GeoDataFrame, output: Path) -> None:
     })
     graph = ox.add_edge_travel_times(graph)
 
+    sys.stdout.write("GraphMLへ書き出し中...\n")
     ox.save_graphml(graph, output)
     print(f"Cached graph saved to {output}")
 

@@ -1,7 +1,9 @@
 """Generate a folium map with isochrones overlaid on a Google Maps-like basemap."""
 
 import argparse
+import os
 import sqlite3
+import sys
 from pathlib import Path
 
 import folium
@@ -9,7 +11,7 @@ import geopandas as gpd
 import networkx as nx
 import osmnx as ox
 import pandas as pd
-from shapely.geometry import Point
+from shapely.geometry import Point, MultiPoint
 
 ox.settings.use_cache = True
 GRAPHML_PATH = Path("cache/ehime_drive.graphml")
@@ -42,25 +44,47 @@ def compute_isochrones(
     graph: nx.MultiDiGraph,
     stations: gpd.GeoDataFrame,
     trip_times: list[int],
+    progress_cb=None,
 ) -> gpd.GeoDataFrame:
-    """Build convex-hull polygons representing reachable areas for each station/time."""
+    """Build convex-hull polygons using single-source Dijkstra per station for speed."""
     iso_records: list[dict] = []
-    for _, row in stations.iterrows():
-        center_point = (row["緯度"], row["経度"])
-        try:
-            center_node = ox.distance.nearest_nodes(graph, center_point[1], center_point[0])
-        except Exception as err:
-            print(f"{row['略称']} 付近のノード取得に失敗: {err}")
-            continue
 
-        for minutes in trip_times:
-            subgraph = nx.ego_graph(graph, center_node, radius=minutes * 60, distance="travel_time")
-            node_points = [Point((data["x"], data["y"])) for _, data in subgraph.nodes(data=True)]
-            if not node_points:
+    xs = stations["経度"].to_list()
+    ys = stations["緯度"].to_list()
+    trip_times_sorted = sorted(trip_times)
+    max_radius = trip_times_sorted[-1] * 60 if trip_times_sorted else 0
+
+    # Vectorized nearest node lookup
+    try:
+        center_nodes = ox.distance.nearest_nodes(graph, xs, ys)
+    except Exception:
+        center_nodes = [ox.distance.nearest_nodes(graph, x, y) for x, y in zip(xs, ys)]
+
+    node_xy = {n: (data["x"], data["y"]) for n, data in graph.nodes(data=True)}
+
+    total = len(center_nodes)
+
+    for idx, (row, center_node) in enumerate(zip(stations.itertuples(index=False), center_nodes)):
+        lengths = nx.single_source_dijkstra_path_length(
+            graph,
+            center_node,
+            cutoff=max_radius,
+            weight="travel_time",
+        )
+
+        for minutes in trip_times_sorted:
+            cutoff = minutes * 60
+            reachable_nodes = [nid for nid, dist in lengths.items() if dist <= cutoff]
+            if not reachable_nodes:
                 continue
+            pts = [node_xy[nid] for nid in reachable_nodes if nid in node_xy]
+            if not pts:
+                continue
+            hull = MultiPoint(pts).convex_hull
+            iso_records.append({"name": row.略称, "time": minutes, "geometry": hull})
 
-            reachable = gpd.GeoSeries(node_points).union_all().convex_hull
-            iso_records.append({"name": row["略称"], "time": minutes, "geometry": reachable})
+        if progress_cb:
+            progress_cb((idx + 1) / total)
 
     if not iso_records:
         raise RuntimeError("到達圏ポリゴンを生成できませんでした。入力データを確認してください。")
@@ -142,6 +166,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _make_progress_printer(total_steps: int):
+    """Lightweight ASCII progress bar for CLI usage without extra deps."""
+    bar_width = 28
+
+    def _update(fraction: float) -> None:
+        fraction = max(0.0, min(1.0, fraction))
+        filled = int(bar_width * fraction)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        percent = int(fraction * 100)
+        sys.stdout.write(f"\r[{bar}] {percent:3d}% ({int(fraction*total_steps)}/{total_steps})")
+        sys.stdout.flush()
+        if fraction >= 1.0:
+            sys.stdout.write("\n")
+
+    return _update
+
+
 def main() -> None:
     args = parse_args()
     stations = load_stations(db_path=STATIONS_DB_PATH, excel_path="map.xlsx")
@@ -176,7 +217,9 @@ def main() -> None:
         ox.save_graphml(graph, GRAPHML_PATH)
 
     trip_times = [5, 10]
-    isochrones = compute_isochrones(graph, stations, trip_times)
+    print("到達圏を計算中...")
+    progress = _make_progress_printer(len(stations))
+    isochrones = compute_isochrones(graph, stations, trip_times, progress_cb=progress)
     render_map(isochrones, stations, output_html=Path(args.output))
 
 

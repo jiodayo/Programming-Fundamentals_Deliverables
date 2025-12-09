@@ -65,6 +65,16 @@ python scripts/precache_graph.py --source map.sqlite --fallback map.xlsx --outpu
 - 一度作成した `cache/ehime_drive.graphml` を再利用することで、`app.py` / `generate_map.py` の起動が高速化されます。
 - GraphMLには速度・到達時間属性を保存するため、再計算を省略できます。
 
+### まとめて実行するスクリプト
+
+よく使う処理をまとめた実行スクリプトを用意しています。
+
+```bash
+./scripts/run_all.sh          # 1) Excel→SQLite, 2) グラフ事前取得, 3) Streamlit起動
+./scripts/run_all.sh --no-app # 1) と 2) のみ実行
+./scripts/run_all.sh --only-app # データとキャッシュがある前提でアプリだけ起動
+```
+
 利用規約の都合でmap.xlsxはこのリポジトリにはあげないです。Teamsにて共有しています。
 
 ## 使い方

@@ -6,8 +6,10 @@ $ streamlit run app.py で実行
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Callable
 
 import folium
 import geopandas as gpd
@@ -16,6 +18,7 @@ import osmnx as ox
 import pandas as pd
 import streamlit as st
 from shapely.geometry import Point
+from shapely.geometry import MultiPoint
 
 ox.settings.use_cache = True
 GRAPHML_PATH = Path("cache/ehime_drive.graphml")
@@ -85,24 +88,56 @@ def compute_isochrones(
     graph: nx.MultiDiGraph,
     stations: gpd.GeoDataFrame,
     trip_times: Iterable[int],
+    progress_cb: Callable[[float], None] | None = None,
 ) -> gpd.GeoDataFrame:
     records: list[dict] = []
-    for _, row in stations.iterrows():
-        center_point = (row["緯度"], row["経度"])
-        try:
-            center_node = ox.distance.nearest_nodes(graph, center_point[1], center_point[0])
-        except Exception as err:
-            st.warning(f"{row['略称']} 付近の道路ノード取得に失敗: {err}")
-            continue
 
-        for minutes in trip_times:
-            subgraph = nx.ego_graph(graph, center_node, radius=minutes * 60, distance="travel_time")
-            node_points = [Point((data["x"], data["y"])) for _, data in subgraph.nodes(data=True)]
-            if not node_points:
+    # Vectorized nearest-node lookup to avoid per-row KDTree rebuilds
+    xs = stations["経度"].to_list()
+    ys = stations["緯度"].to_list()
+    try:
+        center_nodes = ox.distance.nearest_nodes(graph, xs, ys)
+    except Exception:
+        # Fallback to per-point lookup if vectorized call fails
+        center_nodes = [ox.distance.nearest_nodes(graph, x, y) for x, y in zip(xs, ys)]
+
+    total = len(center_nodes)
+
+    # Pre-extract node coordinates to avoid repeated attribute lookups
+    node_xy = {n: (data["x"], data["y"]) for n, data in graph.nodes(data=True)}
+    trip_times_sorted = sorted(trip_times)
+    max_radius = trip_times_sorted[-1] * 60 if trip_times_sorted else 0
+
+    def _one_station(payload: tuple[int, tuple]) -> list[dict]:
+        idx, (row, center_node) = payload
+        out: list[dict] = []
+
+        # Single-source Dijkstra once up to the maximum requested time
+        lengths = nx.single_source_dijkstra_path_length(
+            graph,
+            center_node,
+            cutoff=max_radius,
+            weight="travel_time",
+        )
+
+        for minutes in trip_times_sorted:
+            cutoff = minutes * 60
+            reachable_nodes = [nid for nid, dist in lengths.items() if dist <= cutoff]
+            if not reachable_nodes:
                 continue
+            points = [node_xy[nid] for nid in reachable_nodes if nid in node_xy]
+            if not points:
+                continue
+            hull = MultiPoint(points).convex_hull
+            out.append({"name": row.略称, "time": minutes, "geometry": hull})
 
-            reachable = gpd.GeoSeries(node_points).union_all().convex_hull
-            records.append({"name": row["略称"], "time": minutes, "geometry": reachable})
+        if progress_cb:
+            progress_cb((idx + 1) / total)
+        return out
+
+    with ThreadPoolExecutor(max_workers=min(8, max(2, os.cpu_count() or 2))) as ex:  # type: ignore[name-defined]
+        for chunk in ex.map(_one_station, enumerate(zip(stations.itertuples(index=False), center_nodes))):
+            records.extend(chunk)
 
     if not records:
         raise RuntimeError("到達圏ポリゴンを生成できませんでした。条件を見直してください。")
@@ -210,21 +245,16 @@ def main() -> None:
     bbox = (north_all + padding_deg, south_all - padding_deg, east_all + padding_deg, west_all - padding_deg)
 
     with st.spinner("道路ネットワークを読み込み中..."):
-        load_graph_cached(bbox)
+        graph = load_graph_cached(bbox)
 
-    graph_version = graph_data_version()
-
-    with st.spinner("到達圏データを準備しています..."):
-        all_isochrones = precompute_isochrones(
-            station_df=stations_plain,
-            trip_times=tuple(trip_options),
-            graph_version=graph_version,
+    with st.spinner("到達圏を計算しています..."):
+        prog = st.progress(0)
+        display_isochrones = compute_isochrones(
+            graph=graph,
+            stations=filtered,
+            trip_times=selected_times,
+            progress_cb=lambda p: prog.progress(int(p * 100)),
         )
-
-    display_isochrones = all_isochrones[
-        (all_isochrones["name"].isin(selected_names)) &
-        (all_isochrones["time"].isin(selected_times))
-    ].copy()
 
     if display_isochrones.empty:
         st.error("選択条件に合致する到達圏がありません。")
