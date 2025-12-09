@@ -172,6 +172,24 @@ def load_precomputed_isochrones(path: Path) -> gpd.GeoDataFrame:
     return gpd.read_parquet(path)
 
 
+def append_virtual_stations(base: gpd.GeoDataFrame, virtuals: list[dict]) -> gpd.GeoDataFrame:
+    """Append in-session virtual stations (lat/lon) to the loaded stations."""
+    if not virtuals:
+        return base
+
+    df_new = pd.DataFrame(virtuals)
+    geom = gpd.points_from_xy(df_new["経度"], df_new["緯度"])
+    gdf_new = gpd.GeoDataFrame(df_new, geometry=geom, crs="EPSG:4326")
+
+    # Ensure all columns exist and order matches base
+    for col in base.columns:
+        if col not in gdf_new.columns:
+            gdf_new[col] = None
+    gdf_new = gdf_new[base.columns]
+
+    return pd.concat([base, gdf_new], ignore_index=True)
+
+
 def render_map_html(
     isochrones: gpd.GeoDataFrame,
     stations: gpd.GeoDataFrame,
@@ -227,6 +245,30 @@ def main() -> None:
         excel_path="map.xlsx",
         source_mtime=station_data_version(),
     )
+
+    if "virtual_stations" not in st.session_state:
+        st.session_state["virtual_stations"] = []
+
+    with st.expander("仮想消防署を追加（このセッションのみ）"):
+        with st.form("virtual_station_form"):
+            default_name = f"仮想署{len(st.session_state['virtual_stations']) + 1}"
+            v_name = st.text_input("略称", value=default_name)
+            v_lat = st.number_input("緯度", value=float(stations["緯度"].mean()))
+            v_lon = st.number_input("経度", value=float(stations["経度"].mean()))
+            submitted = st.form_submit_button("追加")
+            if submitted:
+                st.session_state["virtual_stations"].append({
+                    "略称": v_name.strip() or default_name,
+                    "緯度": v_lat,
+                    "経度": v_lon,
+                })
+                st.success(f"仮想消防署を追加: {v_name}")
+        if st.button("仮想消防署をクリア", type="secondary"):
+            st.session_state["virtual_stations"] = []
+            st.info("仮想消防署をクリアしました。")
+
+    has_virtual = bool(st.session_state["virtual_stations"])
+    stations = append_virtual_stations(stations, st.session_state["virtual_stations"])
     stations_plain = stations.drop(columns="geometry").copy()
     station_names = sorted(stations["略称"].unique())
     trip_options = [5, 10, 15, 20]
@@ -262,7 +304,7 @@ def main() -> None:
     with st.spinner("道路ネットワークを読み込み中..."):
         graph = load_graph_cached(bbox)
 
-    if ISOCHRONE_CACHE_PATH.exists():
+    if ISOCHRONE_CACHE_PATH.exists() and not has_virtual:
         try:
             with st.spinner("到達圏キャッシュを読み込み中..."):
                 all_isochrones = load_precomputed_isochrones(ISOCHRONE_CACHE_PATH)

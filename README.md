@@ -7,6 +7,7 @@ OpenStreetMapの道路ネットワークデータを使用し、指定した時�
 
 - **インタラクティブWebアプリ (`app.py`)**: Streamlitを使用したWebインターフェースで、到達圏を動的に確認できます。
 - **静的マップ生成 (`generate_map.py`)**: コマンドラインから実行し、到達圏を描画したHTMLファイルを生成します。
+- **24時間出動タイムライン (`simulate_departures.py`)**: R6.xlsxの実績データを1日分可視化し、救急車ごとの出動〜帰署を時系列で表示します。
 - **キャッシュ機能**: 一度取得した道路ネットワークデータは `cache/` ディレクトリに保存され、次回以降の実行が高速化されます。
 
 ## 必要要件
@@ -103,6 +104,25 @@ streamlit run app.py
 python generate_map.py
 ```
 ※ 引数や設定が必要な場合はスクリプト内の設定を確認してください。
+
+### 3. 24時間の出動タイムラインを描画する
+
+実績データ `R6.xlsx` の指定日を1日分プロットし、救急車ごとの出動〜帰署を時間軸上に可視化します。
+
+```bash
+# 例: 2024-01-01 の出動を「出動署」単位で可視化して PNG 保存（デフォルト）
+python simulate_departures.py --date 2024-01-01 --data R6.xlsx --output outputs/departures_2024-01-01.png
+
+# 保存後に画面表示もしたい場合
+python simulate_departures.py --date 2024-01-01 --show
+```
+
+- `--data`: データファイルのパス (既定: R6.xlsx)
+- `--date`: 対象日 (必須, YYYY-MM-DD)
+- `--group-by`: `station` で出動署ごと（既定）, `vehicle` で車両ごとに並べ替え
+- `--output`: 保存先 (省略時は `outputs/departures_<date>.png`)
+
+出動重複があっても同じ車両が同時に走らないよう、先行ジョブが終わるまで開始時刻を順送りにしています。
 
 ## ファイル構成
 
