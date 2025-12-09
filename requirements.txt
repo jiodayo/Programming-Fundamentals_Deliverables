@@ -1,10 +1,13 @@
-streamlit
-folium
-geopandas
-networkx
-osmnx
-pandas
-shapely
-matplotlib
-japanize-matplotlib
-openpyxl
+streamlit>=1.28,<1.52
+folium>=0.16
+geopandas>=0.14.4
+networkx>=3.2,<3.3  # 3.3+ requires Python>=3.10
+# osmnx 2.x API (graph_from_bbox expects bbox tuple)
+osmnx==2.0.6
+pandas>=2.1
+shapely>=2.0
+matplotlib>=3.7
+japanize-matplotlib>=1.1.3
+openpyxl>=3.1
+# spatial index for geopandas speed (optional but recommended)
+rtree>=1.0.1
