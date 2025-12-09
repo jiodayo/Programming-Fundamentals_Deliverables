@@ -68,6 +68,6 @@ python generate_map.py
 
 - `app.py`: Streamlit Webアプリケーションのメインスクリプト
 - `generate_map.py`: Foliumを使用したHTMLマップ生成スクリプト
-- `experiment.py`: 実験用スクリプト
+- `experiment.py`: 実験用スクリプト、上二つの試作版なので、基本的に使用しなくても大丈夫です
 - `requirements.txt`: 依存ライブラリ一覧
 - `cache/`: 取得した道路ネットワークデータが保存されるディレクトリ（自動生成）
