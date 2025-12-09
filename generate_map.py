@@ -1,7 +1,8 @@
 """Generate a folium map with isochrones overlaid on a Google Maps-like basemap."""
 
-from pathlib import Path
 import argparse
+import sqlite3
+from pathlib import Path
 
 import folium
 import geopandas as gpd
@@ -13,6 +14,7 @@ from shapely.geometry import Point
 ox.settings.use_cache = True
 GRAPHML_PATH = Path("cache/ehime_drive.graphml")
 GRAPHML_PATH.parent.mkdir(parents=True, exist_ok=True)
+STATIONS_DB_PATH = Path("map.sqlite")
 
 
 def load_or_build_graph(north: float, south: float, east: float, west: float) -> nx.MultiDiGraph:
@@ -64,6 +66,18 @@ def compute_isochrones(
         raise RuntimeError("到達圏ポリゴンを生成できませんでした。入力データを確認してください。")
 
     return gpd.GeoDataFrame(iso_records, crs="EPSG:4326")
+
+
+def load_stations(db_path: Path = STATIONS_DB_PATH, excel_path: str = "map.xlsx") -> gpd.GeoDataFrame:
+    """Load station data from SQLite when available, otherwise fallback to Excel."""
+    if db_path.exists():
+        with sqlite3.connect(db_path) as conn:
+            df = pd.read_sql("SELECT * FROM stations", conn)
+    else:
+        df = pd.read_excel(excel_path)
+
+    geometry = gpd.points_from_xy(df["経度"], df["緯度"])
+    return gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
 
 
 def render_map(
@@ -130,9 +144,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    df = pd.read_excel("map.xlsx")
-    geometry = gpd.points_from_xy(df["経度"], df["緯度"])
-    stations = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
+    stations = load_stations(db_path=STATIONS_DB_PATH, excel_path="map.xlsx")
 
     if args.stations:
         selected = stations["略称"].isin(args.stations)

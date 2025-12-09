@@ -43,6 +43,17 @@ pip install -r requirements.txt
 - `経度`: 拠点の経度 (例: 132.7653)
 - その他、拠点名などのカラムがあっても構いません。
 
+### SQLiteに変換する
+
+`map.xlsx` の読み込みがボトルネックになる場合は、SQLiteに変換して高速化できます。
+
+```bash
+python scripts/import_map_to_db.py --input map.xlsx --output map.sqlite
+```
+
+- 変換後は `map.sqlite` を優先的に読み込み、存在しない場合のみ `map.xlsx` を参照します。
+- 元データの共有ポリシー上、`map.sqlite` もリポジトリには含めません。
+
 利用規約の都合でこのリポジトリにはあげないです。Teamsにて共有しています。
 
 ## 使い方

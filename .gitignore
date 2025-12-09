@@ -21,6 +21,7 @@ wheels/
 *.egg
 MANIFEST
 *.xlsx
+*.sqlite
 
 # Virtual Environment
 venv/

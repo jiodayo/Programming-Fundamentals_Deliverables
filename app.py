@@ -5,6 +5,7 @@ $ streamlit run app.py で実行
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Iterable
 
@@ -19,6 +20,7 @@ from shapely.geometry import Point
 ox.settings.use_cache = True
 GRAPHML_PATH = Path("cache/ehime_drive.graphml")
 GRAPHML_PATH.parent.mkdir(parents=True, exist_ok=True)
+STATIONS_DB_PATH = Path("map.sqlite")
 
 
 def graph_data_version() -> float:
@@ -26,9 +28,26 @@ def graph_data_version() -> float:
     return GRAPHML_PATH.stat().st_mtime if GRAPHML_PATH.exists() else 0.0
 
 
+def station_data_version(db_path: Path = STATIONS_DB_PATH, excel_path: str = "map.xlsx") -> float:
+    """Return mtime of the current station datasource for cache invalidation."""
+    if db_path.exists():
+        return db_path.stat().st_mtime
+    return Path(excel_path).stat().st_mtime if Path(excel_path).exists() else 0.0
+
+
 @st.cache_data(show_spinner=False)
-def load_station_data(filepath: str) -> gpd.GeoDataFrame:
-    df = pd.read_excel(filepath)
+def load_station_data(
+    db_path: Path,
+    excel_path: str,
+    source_mtime: float,
+) -> gpd.GeoDataFrame:
+    """Load station records from SQLite when available, otherwise fallback to Excel."""
+    if db_path.exists():
+        with sqlite3.connect(db_path) as conn:
+            df = pd.read_sql("SELECT * FROM stations", conn)
+    else:
+        df = pd.read_excel(excel_path)
+
     geometry = gpd.points_from_xy(df["経度"], df["緯度"])
     return gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
 
@@ -150,7 +169,11 @@ def main() -> None:
     st.title("🚑 愛媛県 救急車到達圏ビューア")
     st.caption("map.xlsx を元に消防署の到達圏を可視化します。")
 
-    stations = load_station_data("map.xlsx")
+    stations = load_station_data(
+        db_path=STATIONS_DB_PATH,
+        excel_path="map.xlsx",
+        source_mtime=station_data_version(),
+    )
     stations_plain = stations.drop(columns="geometry").copy()
     station_names = sorted(stations["略称"].unique())
     trip_options = [5, 10, 15, 20]
