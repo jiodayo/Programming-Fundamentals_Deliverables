@@ -15,7 +15,7 @@ from shapely.geometry import Point, MultiPoint
 ISOCHRONE_CACHE_PATH = Path("cache/isochrones.parquet")
 
 ox.settings.use_cache = True
-GRAPHML_PATH = Path("cache/ehime_drive.graphml")
+GRAPHML_PATH = Path("cache/matsuyama_drive.graphml")
 GRAPHML_PATH.parent.mkdir(parents=True, exist_ok=True)
 STATIONS_DB_PATH = Path("map.sqlite")
 ISOCHRONE_CACHE_PATH = Path("cache/isochrones.parquet")
@@ -34,8 +34,8 @@ def load_or_build_graph(north: float, south: float, east: float, west: float) ->
     except ValueError as exc:
         if "no graph nodes" not in str(exc).lower():
             raise
-        print("指定範囲に道路ノードが見つからなかったため、愛媛県全域データにフォールバックします。")
-        graph = ox.graph_from_place("Ehime, Japan", network_type="drive")
+        print("指定範囲に道路ノードが見つからなかったため、松山市データにフォールバックします。")
+        graph = ox.graph_from_place("Matsuyama, Ehime, Japan", network_type="drive")
 
     ox.save_graphml(graph, GRAPHML_PATH)
     print("道路ネットワークを保存しました。次回以降は高速に読み込めます。")

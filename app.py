@@ -20,11 +20,13 @@ import pandas as pd
 import streamlit as st
 from shapely.geometry import Point
 from shapely.geometry import MultiPoint
+from shapely.ops import unary_union
 
 ox.settings.use_cache = True
-GRAPHML_PATH = Path("cache/ehime_drive.graphml")
+GRAPHML_PATH = Path("cache/matsuyama_drive.graphml")
 GRAPHML_PATH.parent.mkdir(parents=True, exist_ok=True)
 STATIONS_DB_PATH = Path("map.sqlite")
+INCIDENTS_DB_PATH = Path("incidents.sqlite")
 ISOCHRONE_CACHE_PATH = Path("cache/isochrones.parquet")
 GEOCODE_CACHE_PATH = Path("cache/incident_geocode.parquet")
 
@@ -42,14 +44,64 @@ def station_data_version(db_path: Path = STATIONS_DB_PATH, excel_path: str = "ma
 
 
 @st.cache_data(show_spinner=False)
-def load_incident_data(excel_path: str = "R6.xlsx") -> pd.DataFrame:
-    """Load incident records; keeps only rows with a valid 発生日時."""
+def load_incident_data(excel_path: str = "R6.xlsx", db_path: Path = INCIDENTS_DB_PATH) -> pd.DataFrame:
+    """Load R6 incident records from SQLite if available, otherwise from Excel."""
+    if db_path.exists():
+        with sqlite3.connect(db_path) as conn:
+            # Check if table exists
+            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='incidents_r6'")
+            if cursor.fetchone():
+                df = pd.read_sql("SELECT * FROM incidents_r6", conn)
+                df["覚知"] = pd.to_datetime(df["覚知"], errors="coerce")
+                df["date"] = pd.to_datetime(df["date"]).dt.date
+                return df
+    
+    # Fallback to Excel
     if not Path(excel_path).exists():
         raise FileNotFoundError(excel_path)
     df = pd.read_excel(excel_path)
     df["覚知"] = pd.to_datetime(df["覚知"], errors="coerce")
     df = df[df["覚知"].notna()].copy()
     df["date"] = df["覚知"].dt.date
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def load_incident_data_h27(excel_path: str = "H27.xls", db_path: Path = INCIDENTS_DB_PATH) -> pd.DataFrame:
+    """Load H27 incident records from SQLite if available, otherwise from Excel."""
+    if db_path.exists():
+        with sqlite3.connect(db_path) as conn:
+            # Check if table exists
+            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='incidents_h27'")
+            if cursor.fetchone():
+                df = pd.read_sql("SELECT * FROM incidents_h27", conn)
+                df["覚知"] = pd.to_datetime(df["覚知"], errors="coerce")
+                df["date"] = pd.to_datetime(df["date"]).dt.date
+                return df
+    
+    # Fallback to Excel
+    if not Path(excel_path).exists():
+        raise FileNotFoundError(excel_path)
+    df = pd.read_excel(excel_path)
+    
+    # Build datetime from separate columns
+    df["覚知"] = pd.to_datetime(
+        df["覚知日付(年)"].astype(str) + "-" +
+        df["覚知日付(月)"].astype(str).str.zfill(2) + "-" +
+        df["覚知日付(日)"].astype(str).str.zfill(2) + " " +
+        df["覚知時刻(時)"].astype(str).str.zfill(2) + ":" +
+        df["覚知時刻(分)"].astype(str).str.zfill(2) + ":" +
+        df["覚知時刻(秒)"].fillna(0).astype(int).astype(str).str.zfill(2),
+        errors="coerce"
+    )
+    df = df[df["覚知"].notna()].copy()
+    df["date"] = df["覚知"].dt.date
+    
+    # Normalize column names to match R6 format
+    df["出動場所"] = df["出場場所-1"]
+    df["出動隊"] = df["出場隊名"]
+    df["曜日"] = df["覚知曜日名"]
+    
     return df
 
 
@@ -121,7 +173,7 @@ def load_graph_cached(bbox: tuple[float, float, float, float]) -> nx.MultiDiGrap
         except ValueError as exc:
             if "no graph nodes" not in str(exc).lower():
                 raise
-            graph = ox.graph_from_place("Ehime, Japan", network_type="drive")
+            graph = ox.graph_from_place("Matsuyama, Ehime, Japan", network_type="drive")
         ox.save_graphml(graph, GRAPHML_PATH)
 
     if "travel_time" not in next(iter(graph.edges(data=True)))[2]:
@@ -302,7 +354,7 @@ def main() -> None:
     if "virtual_stations" not in st.session_state:
         st.session_state["virtual_stations"] = []
 
-    tab_iso, tab_inc = st.tabs(["到達圏", "出動地点 (R6)" ])
+    tab_iso, tab_inc, tab_coverage = st.tabs(["到達圏", "出動地点 (R6)", "カバー率分析"])
 
     with tab_iso:
         with st.expander("仮想消防署を追加（このセッションのみ）"):
@@ -461,6 +513,343 @@ def main() -> None:
             ).add_to(fmap)
 
         st.components.v1.html(fmap.get_root().render(), height=720)
+
+    with tab_coverage:
+        st.subheader("📊 出動地点の到達圏カバー率分析")
+        st.caption("配置変更前(H27)と変更後(R6)のカバー率を比較します。")
+
+        # Check file availability
+        r6_available = Path("R6.xlsx").exists()
+        h27_available = Path("H27.xls").exists()
+
+        if not r6_available and not h27_available:
+            st.error("出動データファイルが見つかりません。R6.xlsx または H27.xls を配置してください。")
+            st.stop()
+
+        # Dataset selection
+        dataset_options = []
+        if r6_available:
+            dataset_options.append("R6 (配置変更後・2024年)")
+        if h27_available:
+            dataset_options.append("H27 (配置変更前・2015年)")
+        if r6_available and h27_available:
+            dataset_options.append("⭐ 比較モード (R6 vs H27)")
+
+        selected_mode = st.radio(
+            "分析モード",
+            options=dataset_options,
+            horizontal=True,
+        )
+
+        is_comparison = "比較モード" in selected_mode
+
+        # Load or compute isochrones (shared for all modes)
+        stations_cov = load_station_data(
+            db_path=STATIONS_DB_PATH,
+            excel_path="map.xlsx",
+            source_mtime=station_data_version(),
+        )
+        trip_times_cov = [5, 10]
+
+        if ISOCHRONE_CACHE_PATH.exists():
+            try:
+                with st.spinner("到達圏キャッシュを読み込み中..."):
+                    isochrones_cov = load_precomputed_isochrones(ISOCHRONE_CACHE_PATH)
+            except Exception as exc:
+                st.warning(f"キャッシュ読み込み失敗: {exc}")
+                isochrones_cov = None
+        else:
+            isochrones_cov = None
+
+        if isochrones_cov is None:
+            padding_deg = 0.1
+            west_cov, south_cov, east_cov, north_cov = stations_cov.total_bounds
+            bbox_cov = (north_cov + padding_deg, south_cov - padding_deg, east_cov + padding_deg, west_cov - padding_deg)
+            with st.spinner("道路ネットワークを読み込み中..."):
+                graph_cov = load_graph_cached(bbox_cov)
+            with st.spinner("到達圏を計算中..."):
+                prog_cov = st.progress(0)
+                isochrones_cov = compute_isochrones(
+                    graph=graph_cov,
+                    stations=stations_cov,
+                    trip_times=trip_times_cov,
+                    progress_cb=lambda p: prog_cov.progress(int(p * 100)),
+                )
+
+        def analyze_coverage(incidents_df: pd.DataFrame, label: str) -> dict:
+            """Analyze coverage for a given incident dataset."""
+            addr_series = incidents_df["出動場所"].dropna().astype(str)
+            addr_unique = sorted(addr_series.unique())
+
+            geo_df = geocode_addresses(addr_unique, region_prefix="愛媛県")
+            merged = incidents_df.merge(geo_df, left_on="出動場所", right_on="address", how="left")
+            mapped = merged.dropna(subset=["lat", "lon"]).copy()
+
+            if mapped.empty:
+                return None
+
+            incident_points = gpd.GeoDataFrame(
+                mapped,
+                geometry=gpd.points_from_xy(mapped["lon"], mapped["lat"]),
+                crs="EPSG:4326"
+            )
+
+            results = {"label": label, "total": len(incidents_df), "geocoded": len(mapped)}
+            for minutes in trip_times_cov:
+                iso_layer = isochrones_cov[isochrones_cov["time"] == minutes]
+                if iso_layer.empty:
+                    results[f"covered_{minutes}"] = 0
+                    continue
+                combined_polygon = unary_union(iso_layer.geometry)
+                within_mask = incident_points.geometry.within(combined_polygon)
+                results[f"covered_{minutes}"] = within_mask.sum()
+                incident_points[f"within_{minutes}min"] = within_mask
+
+            results["incident_points"] = incident_points
+            results["mapped"] = mapped
+            return results
+
+        if is_comparison:
+            # Comparison mode: analyze both datasets
+            st.markdown("---")
+            col_r6, col_h27 = st.columns(2)
+
+            with col_r6:
+                st.markdown("### 🟢 R6 (配置変更後・2024年)")
+            with col_h27:
+                st.markdown("### 🟡 H27 (配置変更前・2015年)")
+
+            with st.spinner("R6データを分析中..."):
+                incidents_r6 = load_incident_data("R6.xlsx")
+                results_r6 = analyze_coverage(incidents_r6, "R6")
+
+            with st.spinner("H27データを分析中..."):
+                incidents_h27 = load_incident_data_h27("H27.xls")
+                results_h27 = analyze_coverage(incidents_h27, "H27")
+
+            if results_r6 is None or results_h27 is None:
+                st.error("データの分析に失敗しました。")
+                st.stop()
+
+            # Build comparison table
+            comparison_data = []
+            for minutes in trip_times_cov:
+                r6_covered = results_r6[f"covered_{minutes}"]
+                r6_total = results_r6["geocoded"]
+                r6_pct = r6_covered / r6_total * 100 if r6_total > 0 else 0
+
+                h27_covered = results_h27[f"covered_{minutes}"]
+                h27_total = results_h27["geocoded"]
+                h27_pct = h27_covered / h27_total * 100 if h27_total > 0 else 0
+
+                diff = r6_pct - h27_pct
+
+                comparison_data.append({
+                    "到達時間": f"{minutes}分",
+                    "R6 カバー率": f"{r6_pct:.1f}%",
+                    "R6 (件数)": f"{r6_covered}/{r6_total}",
+                    "H27 カバー率": f"{h27_pct:.1f}%",
+                    "H27 (件数)": f"{h27_covered}/{h27_total}",
+                    "差分": f"{diff:+.1f}%",
+                })
+
+            st.markdown("### 📊 カバー率比較")
+            comparison_df = pd.DataFrame(comparison_data)
+            st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+            # Metrics side by side
+            st.markdown("### 📈 差分メトリクス")
+            for minutes in trip_times_cov:
+                r6_pct = results_r6[f"covered_{minutes}"] / results_r6["geocoded"] * 100
+                h27_pct = results_h27[f"covered_{minutes}"] / results_h27["geocoded"] * 100
+                diff = r6_pct - h27_pct
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric(f"R6 {minutes}分到達圏", f"{r6_pct:.1f}%")
+                with col2:
+                    st.metric(f"H27 {minutes}分到達圏", f"{h27_pct:.1f}%")
+                with col3:
+                    st.metric(
+                        f"{minutes}分圏 改善度",
+                        f"{diff:+.1f}%",
+                        delta=f"{diff:+.1f}%" if diff != 0 else None,
+                        delta_color="normal" if diff >= 0 else "inverse"
+                    )
+
+            # Summary
+            st.markdown("---")
+            st.markdown("### 📝 分析サマリ")
+            r6_5min_pct = results_r6["covered_5"] / results_r6["geocoded"] * 100
+            h27_5min_pct = results_h27["covered_5"] / results_h27["geocoded"] * 100
+            r6_10min_pct = results_r6["covered_10"] / results_r6["geocoded"] * 100
+            h27_10min_pct = results_h27["covered_10"] / results_h27["geocoded"] * 100
+
+            if r6_5min_pct > h27_5min_pct:
+                st.success(f"✅ 5分到達圏カバー率: 配置変更後 {r6_5min_pct - h27_5min_pct:+.1f}% 改善")
+            else:
+                st.warning(f"⚠️ 5分到達圏カバー率: 配置変更後 {r6_5min_pct - h27_5min_pct:+.1f}%")
+
+            if r6_10min_pct > h27_10min_pct:
+                st.success(f"✅ 10分到達圏カバー率: 配置変更後 {r6_10min_pct - h27_10min_pct:+.1f}% 改善")
+            else:
+                st.warning(f"⚠️ 10分到達圏カバー率: 配置変更後 {r6_10min_pct - h27_10min_pct:+.1f}%")
+
+            st.info(f"""
+            **データ件数**
+            - R6 (2024年): {results_r6['total']:,} 件 (ジオコーディング成功: {results_r6['geocoded']:,} 件)
+            - H27 (2015年): {results_h27['total']:,} 件 (ジオコーディング成功: {results_h27['geocoded']:,} 件)
+            """)
+
+        else:
+            # Single dataset mode
+            if "R6" in selected_mode:
+                incidents_cov = load_incident_data("R6.xlsx")
+                data_label = "R6 (2024年)"
+            else:
+                incidents_cov = load_incident_data_h27("H27.xls")
+                data_label = "H27 (2015年)"
+
+            st.markdown(f"### 📅 {data_label} のカバー率分析")
+            st.write(f"全出動件数: {len(incidents_cov):,} 件")
+
+            with st.spinner("住所をジオコーディング中..."):
+                results = analyze_coverage(incidents_cov, data_label)
+
+            if results is None:
+                st.error("出動地点をジオコーディングできませんでした。")
+                st.stop()
+
+            incident_points = results["incident_points"]
+            mapped_cov = results["mapped"]
+
+            geocoded_rate = results["geocoded"] / results["total"] * 100
+            st.write(f"📍 ジオコーディング成功: {results['geocoded']:,} / {results['total']:,} 件 ({geocoded_rate:.1f}%)")
+
+            # Calculate coverage for each time threshold
+            st.markdown("---")
+            st.subheader("📊 カバー率結果")
+
+            coverage_results = []
+            for minutes in trip_times_cov:
+                covered_count = results[f"covered_{minutes}"]
+                total_count = results["geocoded"]
+                coverage_pct = covered_count / total_count * 100 if total_count > 0 else 0
+
+                coverage_results.append({
+                    "到達時間": f"{minutes}分",
+                    "カバー数": covered_count,
+                    "全件数": total_count,
+                    "カバー率": f"{coverage_pct:.1f}%",
+                })
+
+            if coverage_results:
+                coverage_df = pd.DataFrame(coverage_results)
+                st.dataframe(coverage_df, use_container_width=True, hide_index=True)
+
+                # Show metrics
+                cols = st.columns(len(coverage_results))
+                for i, res in enumerate(coverage_results):
+                    with cols[i]:
+                        st.metric(
+                            label=f"{res['到達時間']}到達圏",
+                            value=res["カバー率"],
+                            delta=f"{res['カバー数']}/{res['全件数']}件"
+                        )
+
+            # Render map with coverage visualization
+            st.markdown("---")
+            st.subheader("🗺️ カバー状況マップ")
+
+            center_lat_cov = mapped_cov["lat"].mean()
+            center_lon_cov = mapped_cov["lon"].mean()
+            fmap_cov = folium.Map(location=[center_lat_cov, center_lon_cov], zoom_start=11, tiles="CartoDB Positron")
+
+            # Add isochrone layers
+            color_map_cov = {5: "#ff9e9e", 10: "#8aa5ff"}
+            for minutes in trip_times_cov:
+                iso_layer = isochrones_cov[isochrones_cov["time"] == minutes]
+                if iso_layer.empty:
+                    continue
+                color = color_map_cov.get(minutes, "#4a4a4a")
+                folium.GeoJson(
+                    data=iso_layer.__geo_interface__,
+                    name=f"{minutes}分到達圏",
+                    style_function=lambda _f, c=color, m=minutes: {
+                        "fillColor": c,
+                        "color": c,
+                        "weight": 1.0,
+                        "opacity": 0.5,
+                        "fillOpacity": 0.15 if m >= 10 else 0.25,
+                    },
+                ).add_to(fmap_cov)
+
+            # Add station markers
+            for _, row in stations_cov.iterrows():
+                folium.CircleMarker(
+                    location=[row["緯度"], row["経度"]],
+                    radius=6,
+                    color="#1f1f1f",
+                    weight=2,
+                    fill=True,
+                    fill_color="#f6bd60",
+                    fill_opacity=0.9,
+                    popup=f"{row['略称']}",
+                ).add_to(fmap_cov)
+
+            # Add incident markers with coverage status
+            for _, row in incident_points.iterrows():
+                within_5 = row.get("within_5min", False)
+                within_10 = row.get("within_10min", False)
+
+                if within_5:
+                    color = "#2ecc71"  # Green - covered by 5min
+                    status = "5分内"
+                elif within_10:
+                    color = "#f39c12"  # Orange - covered by 10min
+                    status = "10分内"
+                else:
+                    color = "#e74c3c"  # Red - not covered
+                    status = "圏外"
+
+                label_time = row["覚知"].strftime("%H:%M") if not pd.isna(row.get("覚知")) else "--:--"
+                popup = f"{status} | {row.get('出動隊', '不明')} | {label_time}"
+                folium.CircleMarker(
+                    location=[row.geometry.y, row.geometry.x],
+                    radius=4,
+                    color=color,
+                    fill=True,
+                    fill_color=color,
+                    fill_opacity=0.8,
+                    weight=1.0,
+                    popup=popup,
+                ).add_to(fmap_cov)
+
+            # Add legend
+            legend_html = '''
+            <div style="position: fixed; bottom: 50px; left: 50px; z-index: 1000;
+                        background-color: white; padding: 10px; border-radius: 5px;
+                        border: 2px solid gray; font-size: 12px;">
+                <b>出動地点</b><br>
+                <span style="color: #2ecc71;">●</span> 5分内到達<br>
+                <span style="color: #f39c12;">●</span> 10分内到達<br>
+                <span style="color: #e74c3c;">●</span> 到達圏外
+            </div>
+            '''
+            fmap_cov.get_root().html.add_child(folium.Element(legend_html))
+
+            folium.LayerControl(collapsed=False).add_to(fmap_cov)
+            st.components.v1.html(fmap_cov.get_root().render(), height=720)
+
+            # Show uncovered incidents detail
+            if "within_10min" in incident_points.columns:
+                uncovered = incident_points[~incident_points["within_10min"]]
+                if not uncovered.empty:
+                    st.markdown("---")
+                    st.subheader(f"⚠️ 10分到達圏外の出動 ({len(uncovered)} 件)")
+                    uncovered_display = uncovered[["date", "覚知", "出動場所", "出動隊"]].copy()
+                    uncovered_display.columns = ["日付", "覚知時刻", "出動場所", "出動隊"]
+                    st.dataframe(uncovered_display, use_container_width=True, hide_index=True)
 
     st.info("アプリを終了するには、実行中のターミナルで Ctrl+C を押してください。")
 
