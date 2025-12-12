@@ -33,6 +33,11 @@ ENV/
 # Project specific
 cache/
 *.graphml
+*.parquet
 map.xlsx
+R6.xlsx
+H27.xls
+*.sqlite
 *.html
 .DS_Store
+misc/outputs/
