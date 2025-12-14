@@ -706,13 +706,68 @@ def main() -> None:
         if r6_available and h27_available:
             dataset_options.append("⭐ 比較モード (R6 vs H27)")
 
-        selected_mode = st.radio(
-            "分析モード",
-            options=dataset_options,
-            horizontal=True,
-        )
-
+        col_mode, col_traffic = st.columns([2, 1])
+        with col_mode:
+            selected_mode = st.radio(
+                "分析モード",
+                options=dataset_options,
+                horizontal=True,
+            )
+        
         is_comparison = "比較モード" in selected_mode
+
+        # ========== 🚦 渋滞考慮 & 時間帯別分析 ==========
+        with st.expander("🚦 時間帯別カバー率分析", expanded=False):
+            factors_exist_cov = DELAY_FACTORS_PATH.exists()
+            if factors_exist_cov:
+                st.success("✅ R6実データから学習した遅延係数を使用")
+            else:
+                st.warning("⚠️ misc/learn_delays.py を実行すると学習できます")
+
+            analysis_type = st.radio(
+                "分析タイプ",
+                ["通常（渋滞なし）", "🕐 時間帯別カバー率", "🚦 特定時間帯の渋滞考慮"],
+                horizontal=True,
+                key="coverage_analysis_type",
+            )
+
+            cov_delay_factor = 1.0
+            selected_hour_cov = None
+            hourly_analysis = False
+
+            if analysis_type == "🕐 時間帯別カバー率":
+                hourly_analysis = True
+                st.info("📊 出動時刻に基づいて時間帯別のカバー率を集計します")
+            
+            elif analysis_type == "🚦 特定時間帯の渋滞考慮":
+                col_slot, col_info = st.columns([1, 1])
+                with col_slot:
+                    time_slot_cov = st.selectbox(
+                        "時間帯",
+                        options=list(TIME_SLOT_LABELS.keys()),
+                        index=3,
+                        key="coverage_time_slot",
+                    )
+                    slot_hours_cov = TIME_SLOT_LABELS[time_slot_cov]
+                    selected_hour_cov = slot_hours_cov[len(slot_hours_cov) // 2]
+                    cov_delay_factor = get_delay_factor(selected_hour_cov)
+                
+                with col_info:
+                    if cov_delay_factor < 1.0:
+                        emoji_cov = "🟢"
+                        desc_cov = "救急優先走行で速い"
+                    elif cov_delay_factor < 1.1:
+                        emoji_cov = "🟡"
+                        desc_cov = "通常"
+                    else:
+                        emoji_cov = "🔴"
+                        desc_cov = "やや混雑"
+                    st.metric(
+                        "遅延係数",
+                        f"{cov_delay_factor:.3f}",
+                        delta=desc_cov,
+                    )
+        # ================================================
 
         # Load or compute isochrones (shared for all modes)
         stations_cov = load_station_data(
@@ -722,7 +777,10 @@ def main() -> None:
         )
         trip_times_cov = [5, 10]
 
-        if ISOCHRONE_CACHE_PATH.exists():
+        # 渋滞考慮モードではキャッシュを使わず再計算
+        use_cache_cov = ISOCHRONE_CACHE_PATH.exists() and cov_delay_factor == 1.0
+
+        if use_cache_cov:
             try:
                 with st.spinner("到達圏キャッシュを読み込み中..."):
                     isochrones_cov = load_precomputed_isochrones(ISOCHRONE_CACHE_PATH)
@@ -738,17 +796,24 @@ def main() -> None:
             bbox_cov = (north_cov + padding_deg, south_cov - padding_deg, east_cov + padding_deg, west_cov - padding_deg)
             with st.spinner("道路ネットワークを読み込み中..."):
                 graph_cov = load_graph_cached(bbox_cov)
-            with st.spinner("到達圏を計算中..."):
+            spinner_msg_cov = "到達圏を計算中..."
+            if cov_delay_factor != 1.0:
+                spinner_msg_cov = f"渋滞考慮で到達圏を計算中（係数: {cov_delay_factor:.3f}）..."
+            with st.spinner(spinner_msg_cov):
                 prog_cov = st.progress(0)
                 isochrones_cov = compute_isochrones(
                     graph=graph_cov,
                     stations=stations_cov,
                     trip_times=trip_times_cov,
                     progress_cb=lambda p: prog_cov.progress(int(p * 100)),
+                    delay_factor=cov_delay_factor,
                 )
 
-        def analyze_coverage(incidents_df: pd.DataFrame, label: str) -> dict:
+        def analyze_coverage(incidents_df: pd.DataFrame, label: str, isochrones: gpd.GeoDataFrame = None) -> dict:
             """Analyze coverage for a given incident dataset."""
+            if isochrones is None:
+                isochrones = isochrones_cov
+            
             addr_series = incidents_df["出動場所"].dropna().astype(str)
             addr_unique = sorted(addr_series.unique())
 
@@ -767,7 +832,7 @@ def main() -> None:
 
             results = {"label": label, "total": len(incidents_df), "geocoded": len(mapped)}
             for minutes in trip_times_cov:
-                iso_layer = isochrones_cov[isochrones_cov["time"] == minutes]
+                iso_layer = isochrones[isochrones["time"] == minutes]
                 if iso_layer.empty:
                     results[f"covered_{minutes}"] = 0
                     continue
@@ -779,6 +844,223 @@ def main() -> None:
             results["incident_points"] = incident_points
             results["mapped"] = mapped
             return results
+
+        def analyze_hourly_coverage(incidents_df: pd.DataFrame) -> pd.DataFrame:
+            """Analyze coverage by hour of day."""
+            # 時間帯の定義
+            time_bins = {
+                "深夜 (0-5時)": list(range(0, 5)),
+                "早朝 (5-7時)": list(range(5, 7)),
+                "朝ラッシュ (7-9時)": list(range(7, 9)),
+                "午前 (9-12時)": list(range(9, 12)),
+                "昼 (12-14時)": list(range(12, 14)),
+                "午後 (14-17時)": list(range(14, 17)),
+                "夕ラッシュ (17-19時)": list(range(17, 19)),
+                "夜 (19-22時)": list(range(19, 22)),
+                "深夜 (22-24時)": list(range(22, 24)),
+            }
+            
+            # ジオコーディング
+            addr_series = incidents_df["出動場所"].dropna().astype(str)
+            addr_unique = sorted(addr_series.unique())
+            geo_df = geocode_addresses(addr_unique, region_prefix="愛媛県")
+            merged = incidents_df.merge(geo_df, left_on="出動場所", right_on="address", how="left")
+            mapped = merged.dropna(subset=["lat", "lon"]).copy()
+            
+            if mapped.empty:
+                return None
+            
+            # 時間帯列を追加
+            mapped["hour"] = pd.to_datetime(mapped["覚知"], errors="coerce").dt.hour
+            
+            incident_points = gpd.GeoDataFrame(
+                mapped,
+                geometry=gpd.points_from_xy(mapped["lon"], mapped["lat"]),
+                crs="EPSG:4326"
+            )
+            
+            # 時間帯ごとにカバー率を計算
+            results = []
+            for slot_name, hours in time_bins.items():
+                slot_points = incident_points[incident_points["hour"].isin(hours)]
+                if slot_points.empty:
+                    continue
+                
+                total = len(slot_points)
+                row = {"時間帯": slot_name, "件数": total}
+                
+                for minutes in trip_times_cov:
+                    iso_layer = isochrones_cov[isochrones_cov["time"] == minutes]
+                    if iso_layer.empty:
+                        row[f"{minutes}分圏カバー"] = 0
+                        row[f"{minutes}分圏率"] = 0.0
+                        continue
+                    combined_polygon = unary_union(iso_layer.geometry)
+                    within_mask = slot_points.geometry.within(combined_polygon)
+                    covered = within_mask.sum()
+                    row[f"{minutes}分圏カバー"] = covered
+                    row[f"{minutes}分圏率"] = covered / total * 100 if total > 0 else 0
+                
+                results.append(row)
+            
+            return pd.DataFrame(results)
+
+        # ========== 時間帯別分析モード ==========
+        if hourly_analysis:
+            st.markdown("---")
+            st.subheader("🕐 時間帯別カバー率分析")
+            
+            import altair as alt
+            
+            # 比較モードの場合は両方のデータを分析
+            if is_comparison:
+                col_r6_h, col_h27_h = st.columns(2)
+                
+                with st.spinner("R6データの時間帯別カバー率を計算中..."):
+                    incidents_r6_hourly = load_incident_data("R6.xlsx")
+                    hourly_df_r6 = analyze_hourly_coverage(incidents_r6_hourly)
+                
+                with st.spinner("H27データの時間帯別カバー率を計算中..."):
+                    incidents_h27_hourly = load_incident_data_h27("H27.xls")
+                    hourly_df_h27 = analyze_hourly_coverage(incidents_h27_hourly)
+                
+                if hourly_df_r6 is not None and hourly_df_h27 is not None:
+                    # 並べて表示
+                    with col_r6_h:
+                        st.markdown("### 🟢 R6 (2024年)")
+                        display_df_r6 = hourly_df_r6[["時間帯", "件数", "5分圏率", "10分圏率"]].copy()
+                        display_df_r6["5分圏率"] = display_df_r6["5分圏率"].apply(lambda x: f"{x:.1f}%")
+                        display_df_r6["10分圏率"] = display_df_r6["10分圏率"].apply(lambda x: f"{x:.1f}%")
+                        st.dataframe(display_df_r6, use_container_width=True, hide_index=True)
+                    
+                    with col_h27_h:
+                        st.markdown("### 🟡 H27 (2015年)")
+                        display_df_h27 = hourly_df_h27[["時間帯", "件数", "5分圏率", "10分圏率"]].copy()
+                        display_df_h27["5分圏率"] = display_df_h27["5分圏率"].apply(lambda x: f"{x:.1f}%")
+                        display_df_h27["10分圏率"] = display_df_h27["10分圏率"].apply(lambda x: f"{x:.1f}%")
+                        st.dataframe(display_df_h27, use_container_width=True, hide_index=True)
+                    
+                    # 比較グラフ（5分圏）
+                    st.markdown("### 📈 5分圏カバー率比較グラフ")
+                    
+                    # データを結合
+                    hourly_df_r6["データ"] = "R6 (2024年)"
+                    hourly_df_h27["データ"] = "H27 (2015年)"
+                    combined_hourly = pd.concat([hourly_df_r6, hourly_df_h27], ignore_index=True)
+                    
+                    chart_5min = alt.Chart(combined_hourly).mark_bar().encode(
+                        x=alt.X("時間帯:N", sort=list(TIME_SLOT_LABELS.keys()), title="時間帯"),
+                        y=alt.Y("5分圏率:Q", title="5分圏カバー率 (%)"),
+                        color=alt.Color("データ:N", scale=alt.Scale(
+                            domain=["R6 (2024年)", "H27 (2015年)"],
+                            range=["#2ecc71", "#f1c40f"]
+                        )),
+                        xOffset="データ:N",
+                        tooltip=["時間帯", "データ", alt.Tooltip("5分圏率:Q", format=".1f"), "件数"],
+                    ).properties(
+                        width=600,
+                        height=350,
+                    )
+                    st.altair_chart(chart_5min, use_container_width=True)
+                    
+                    # 差分テーブル
+                    st.markdown("### 📊 時間帯別 改善度（R6 - H27）")
+                    diff_data = []
+                    for slot in hourly_df_r6["時間帯"].unique():
+                        r6_row = hourly_df_r6[hourly_df_r6["時間帯"] == slot]
+                        h27_row = hourly_df_h27[hourly_df_h27["時間帯"] == slot]
+                        if not r6_row.empty and not h27_row.empty:
+                            diff_5 = r6_row["5分圏率"].values[0] - h27_row["5分圏率"].values[0]
+                            diff_10 = r6_row["10分圏率"].values[0] - h27_row["10分圏率"].values[0]
+                            diff_data.append({
+                                "時間帯": slot,
+                                "5分圏改善": f"{diff_5:+.1f}%",
+                                "10分圏改善": f"{diff_10:+.1f}%",
+                            })
+                    
+                    diff_df = pd.DataFrame(diff_data)
+                    st.dataframe(diff_df, use_container_width=True, hide_index=True)
+                    
+                    # サマリ
+                    st.markdown("### 🔍 分析サマリ")
+                    avg_diff_5 = (hourly_df_r6["5分圏率"].mean() - hourly_df_h27["5分圏率"].mean())
+                    avg_diff_10 = (hourly_df_r6["10分圏率"].mean() - hourly_df_h27["10分圏率"].mean())
+                    
+                    if avg_diff_5 > 0:
+                        st.success(f"✅ 全時間帯平均 5分圏カバー率: **{avg_diff_5:+.1f}%** 改善")
+                    else:
+                        st.warning(f"⚠️ 全時間帯平均 5分圏カバー率: **{avg_diff_5:+.1f}%**")
+                    
+                    if avg_diff_10 > 0:
+                        st.success(f"✅ 全時間帯平均 10分圏カバー率: **{avg_diff_10:+.1f}%** 改善")
+                    else:
+                        st.warning(f"⚠️ 全時間帯平均 10分圏カバー率: **{avg_diff_10:+.1f}%**")
+                else:
+                    st.error("時間帯別分析に失敗しました。")
+            
+            else:
+                # 単一データセットモード
+                if "R6" in selected_mode:
+                    incidents_hourly = load_incident_data("R6.xlsx")
+                    data_label_hourly = "R6 (2024年)"
+                else:
+                    incidents_hourly = load_incident_data_h27("H27.xls")
+                    data_label_hourly = "H27 (2015年)"
+                
+                with st.spinner(f"{data_label_hourly} の時間帯別カバー率を計算中..."):
+                    hourly_df = analyze_hourly_coverage(incidents_hourly)
+                
+                if hourly_df is not None:
+                    st.markdown(f"### 📊 {data_label_hourly} 時間帯別カバー率")
+                    
+                    # テーブル表示
+                    display_df = hourly_df.copy()
+                    display_df["5分圏率"] = display_df["5分圏率"].apply(lambda x: f"{x:.1f}%")
+                    display_df["10分圏率"] = display_df["10分圏率"].apply(lambda x: f"{x:.1f}%")
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+                    
+                    # グラフ表示
+                    st.markdown("### 📈 時間帯別カバー率グラフ")
+                    
+                    chart_data = hourly_df.melt(
+                        id_vars=["時間帯", "件数"],
+                        value_vars=["5分圏率", "10分圏率"],
+                        var_name="到達圏",
+                        value_name="カバー率",
+                    )
+                    
+                    chart = alt.Chart(chart_data).mark_bar().encode(
+                        x=alt.X("時間帯:N", sort=list(TIME_SLOT_LABELS.keys()), title="時間帯"),
+                        y=alt.Y("カバー率:Q", title="カバー率 (%)"),
+                        color=alt.Color("到達圏:N", scale=alt.Scale(
+                            domain=["5分圏率", "10分圏率"],
+                            range=["#ff9e9e", "#8aa5ff"]
+                        )),
+                        xOffset="到達圏:N",
+                        tooltip=["時間帯", "到達圏", alt.Tooltip("カバー率:Q", format=".1f"), "件数"],
+                    ).properties(
+                        width=600,
+                        height=400,
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+                    
+                    # 時間帯間の差を分析
+                    st.markdown("### 🔍 分析サマリ")
+                    best_5min = hourly_df.loc[hourly_df["5分圏率"].idxmax()]
+                    worst_5min = hourly_df.loc[hourly_df["5分圏率"].idxmin()]
+                    
+                    col_best, col_worst = st.columns(2)
+                    with col_best:
+                        st.success(f"✅ 5分圏カバー率 最高: **{best_5min['時間帯']}** ({best_5min['5分圏率']:.1f}%)")
+                    with col_worst:
+                        st.warning(f"⚠️ 5分圏カバー率 最低: **{worst_5min['時間帯']}** ({worst_5min['5分圏率']:.1f}%)")
+                    
+                    st.info(f"📊 時間帯による5分圏カバー率の差: **{best_5min['5分圏率'] - worst_5min['5分圏率']:.1f}%**")
+                else:
+                    st.error("時間帯別分析に失敗しました。")
+            
+            st.stop()  # 時間帯別分析モードでは以降の処理をスキップ
+        # ========================================
 
         if is_comparison:
             # Comparison mode: analyze both datasets
