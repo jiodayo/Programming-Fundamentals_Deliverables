@@ -23,6 +23,15 @@ from shapely.geometry import Point
 from shapely.geometry import MultiPoint
 from shapely.ops import unary_union
 
+# Traffic-aware isochrones
+from traffic_analysis import (
+    load_delay_factors,
+    get_delay_factor,
+    TIME_SLOT_LABELS,
+    DOW_LABELS,
+    DELAY_FACTORS_PATH,
+)
+
 ox.settings.use_cache = True
 GRAPHML_PATH = Path("cache/matsuyama_drive.graphml")
 GRAPHML_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -196,7 +205,13 @@ def compute_isochrones(
     stations: gpd.GeoDataFrame,
     trip_times: Iterable[int],
     progress_cb: Callable[[float], None] | None = None,
+    delay_factor: float = 1.0,
 ) -> gpd.GeoDataFrame:
+    """Compute isochrones with optional traffic delay factor.
+    
+    Args:
+        delay_factor: Multiplier for travel times (>1 means slower due to traffic)
+    """
     records: list[dict] = []
 
     # Vectorized nearest-node lookup to avoid per-row KDTree rebuilds
@@ -213,7 +228,8 @@ def compute_isochrones(
     # Pre-extract node coordinates to avoid repeated attribute lookups
     node_xy = {n: (data["x"], data["y"]) for n, data in graph.nodes(data=True)}
     trip_times_sorted = sorted(trip_times)
-    max_radius = trip_times_sorted[-1] * 60 if trip_times_sorted else 0
+    # Adjust max_radius by delay factor (if delay_factor > 1, effective range shrinks)
+    max_radius = (trip_times_sorted[-1] * 60 / delay_factor) if trip_times_sorted else 0
 
     def _one_station(payload: tuple[int, tuple]) -> list[dict]:
         _idx, (row, center_node) = payload
@@ -228,7 +244,8 @@ def compute_isochrones(
         )
 
         for minutes in trip_times_sorted:
-            cutoff = minutes * 60
+            # With delay_factor > 1, effective reach shrinks (slower travel)
+            cutoff = minutes * 60 / delay_factor
             reachable_nodes = [nid for nid, dist in lengths.items() if dist <= cutoff]
             if not reachable_nodes:
                 continue
@@ -487,6 +504,61 @@ def main() -> None:
                 default=[5, 10],
             )
 
+        # ========== 🚦 渋滞考慮モード ==========
+        with st.expander("🚦 渋滞考慮モード（実データ学習済み）", expanded=False):
+            factors_exist = DELAY_FACTORS_PATH.exists()
+            if factors_exist:
+                st.success("✅ R6実データから学習した遅延係数を使用")
+            else:
+                st.warning("⚠️ misc/learn_delays.py を実行すると学習できます")
+
+            traffic_enabled = st.toggle("渋滞を考慮する", value=False, key="traffic_enabled")
+
+            if traffic_enabled:
+                col_time, col_dow = st.columns(2)
+                with col_time:
+                    time_slot = st.selectbox(
+                        "時間帯",
+                        options=list(TIME_SLOT_LABELS.keys()),
+                        index=3,  # 朝ラッシュ
+                        key="traffic_time_slot",
+                    )
+                    # 代表的な時間を取得
+                    slot_hours = TIME_SLOT_LABELS[time_slot]
+                    selected_hour = slot_hours[len(slot_hours) // 2]
+
+                with col_dow:
+                    use_dow = st.checkbox("曜日も考慮", value=False, key="traffic_use_dow")
+                    if use_dow:
+                        dow_label = st.selectbox(
+                            "曜日",
+                            options=DOW_LABELS,
+                            index=0,
+                            key="traffic_dow",
+                        )
+                        selected_dow = DOW_LABELS.index(dow_label)
+                    else:
+                        selected_dow = None
+
+                delay_factor = get_delay_factor(selected_hour, selected_dow)
+                
+                # 係数の意味を表示
+                if delay_factor < 1.0:
+                    emoji = "🟢"
+                    desc = "深夜より速い（救急優先走行の効果大）"
+                elif delay_factor < 1.1:
+                    desc = "通常"
+                    emoji = "🟡"
+                else:
+                    desc = "やや混雑"
+                    emoji = "🔴"
+                
+                st.info(f"{emoji} 遅延係数: **{delay_factor:.3f}** ({desc})")
+                st.caption(f"→ 例: 5分圏が実質 {5 * delay_factor:.1f}分圏 に縮小")
+            else:
+                delay_factor = 1.0
+        # ========================================
+
         if not selected_names:
             st.warning("少なくとも1つの消防署を選択してください。")
             st.stop()
@@ -503,7 +575,10 @@ def main() -> None:
         with st.spinner("道路ネットワークを読み込み中..."):
             graph = load_graph_cached(bbox)
 
-        if ISOCHRONE_CACHE_PATH.exists() and not has_virtual:
+        # 渋滞考慮モードではキャッシュを使わず再計算（係数が異なるため）
+        use_cache = ISOCHRONE_CACHE_PATH.exists() and not has_virtual and delay_factor == 1.0
+        
+        if use_cache:
             try:
                 with st.spinner("到達圏キャッシュを読み込み中..."):
                     all_isochrones = load_precomputed_isochrones(ISOCHRONE_CACHE_PATH)
@@ -518,13 +593,17 @@ def main() -> None:
             display_isochrones = None
 
         if display_isochrones is None:
-            with st.spinner("到達圏を計算しています..."):
+            spinner_msg = "到達圏を計算しています..."
+            if delay_factor != 1.0:
+                spinner_msg = f"渋滞考慮で到達圏を計算中（係数: {delay_factor:.3f}）..."
+            with st.spinner(spinner_msg):
                 prog = st.progress(0)
                 display_isochrones = compute_isochrones(
                     graph=graph,
                     stations=filtered,
                     trip_times=selected_times,
                     progress_cb=lambda p: prog.progress(int(p * 100)),
+                    delay_factor=delay_factor,
                 )
 
         if display_isochrones.empty:
