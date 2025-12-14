@@ -18,6 +18,7 @@ import networkx as nx
 import osmnx as ox
 import pandas as pd
 import streamlit as st
+from streamlit_folium import st_folium
 from shapely.geometry import Point
 from shapely.geometry import MultiPoint
 from shapely.ops import unary_union
@@ -295,6 +296,47 @@ def append_virtual_stations(base: gpd.GeoDataFrame, virtuals: list[dict]) -> gpd
     return pd.concat([base, gdf_new], ignore_index=True)
 
 
+def create_location_picker_map(
+    stations: gpd.GeoDataFrame,
+    virtual_stations: list[dict] | None = None,
+) -> folium.Map:
+    """Create an interactive map for picking locations to add virtual stations."""
+    center_lat = stations["緯度"].mean()
+    center_lon = stations["経度"].mean()
+    fmap = folium.Map(location=[center_lat, center_lon], zoom_start=11, tiles="CartoDB Positron")
+
+    # Show existing stations
+    for _, row in stations.iterrows():
+        folium.CircleMarker(
+            location=[row["緯度"], row["経度"]],
+            radius=7,
+            color="#1f1f1f",
+            weight=2,
+            fill=True,
+            fill_color="#f6bd60",
+            fill_opacity=0.9,
+            popup=f"{row['略称']}",
+            tooltip=f"既存: {row['略称']}",
+        ).add_to(fmap)
+
+    # Show virtual stations (if any)
+    if virtual_stations:
+        for vs in virtual_stations:
+            folium.CircleMarker(
+                location=[vs["緯度"], vs["経度"]],
+                radius=8,
+                color="#e63946",
+                weight=2,
+                fill=True,
+                fill_color="#e63946",
+                fill_opacity=0.9,
+                popup=f"仮想: {vs['略称']}",
+                tooltip=f"仮想: {vs['略称']}",
+            ).add_to(fmap)
+
+    return fmap
+
+
 def render_map_html(
     isochrones: gpd.GeoDataFrame,
     stations: gpd.GeoDataFrame,
@@ -357,23 +399,73 @@ def main() -> None:
     tab_iso, tab_inc, tab_coverage = st.tabs(["到達圏", "出動地点 (R6)", "カバー率分析"])
 
     with tab_iso:
-        with st.expander("仮想消防署を追加（このセッションのみ）"):
-            with st.form("virtual_station_form"):
+        with st.expander("🗺️ 仮想消防署を追加（このセッションのみ）", expanded=False):
+            st.markdown("**地図をクリックして仮想消防署の場所を選択してください**")
+            st.caption("クリック後、名前を入力して「追加」ボタンを押してください。")
+
+            # クリック選択用の地図を表示
+            picker_map = create_location_picker_map(
+                stations,
+                st.session_state["virtual_stations"],
+            )
+            map_data = st_folium(
+                picker_map,
+                width=700,
+                height=400,
+                key="location_picker",
+                returned_objects=["last_clicked"],
+            )
+
+            # クリックした座標を取得
+            clicked_lat = None
+            clicked_lon = None
+            if map_data and map_data.get("last_clicked"):
+                clicked_lat = map_data["last_clicked"]["lat"]
+                clicked_lon = map_data["last_clicked"]["lng"]
+
+            col_info, col_add = st.columns([2, 1])
+            with col_info:
+                if clicked_lat is not None:
+                    st.success(f"📍 選択位置: 緯度 {clicked_lat:.6f}, 経度 {clicked_lon:.6f}")
+                else:
+                    st.info("💡 地図をクリックして場所を選択してください")
+
+            with col_add:
                 default_name = f"仮想署{len(st.session_state['virtual_stations']) + 1}"
-                v_name = st.text_input("略称", value=default_name)
-                v_lat = st.number_input("緯度", value=float(stations["緯度"].mean()))
-                v_lon = st.number_input("経度", value=float(stations["経度"].mean()))
-                submitted = st.form_submit_button("追加")
-                if submitted:
-                    st.session_state["virtual_stations"].append({
-                        "略称": v_name.strip() or default_name,
-                        "緯度": v_lat,
-                        "経度": v_lon,
-                    })
-                    st.success(f"仮想消防署を追加: {v_name}")
-            if st.button("仮想消防署をクリア", type="secondary"):
-                st.session_state["virtual_stations"] = []
-                st.info("仮想消防署をクリアしました。")
+                v_name = st.text_input("名前", value=default_name, key="virtual_name_input")
+
+            # 追加ボタン
+            col_btn1, col_btn2 = st.columns(2)
+            with col_btn1:
+                if st.button("✅ この場所に追加", type="primary", disabled=(clicked_lat is None)):
+                    if clicked_lat is not None:
+                        st.session_state["virtual_stations"].append({
+                            "略称": v_name.strip() or default_name,
+                            "緯度": clicked_lat,
+                            "経度": clicked_lon,
+                        })
+                        st.success(f"仮想消防署を追加しました: {v_name}")
+                        st.rerun()
+            with col_btn2:
+                if st.button("🗑️ 全てクリア", type="secondary"):
+                    st.session_state["virtual_stations"] = []
+                    st.info("仮想消防署をクリアしました。")
+                    st.rerun()
+
+            # 追加済み仮想消防署一覧
+            if st.session_state["virtual_stations"]:
+                st.markdown("---")
+                st.markdown("**追加済み仮想消防署:**")
+                for i, vs in enumerate(st.session_state["virtual_stations"]):
+                    col_name, col_coord, col_del = st.columns([2, 3, 1])
+                    with col_name:
+                        st.write(f"🔴 {vs['略称']}")
+                    with col_coord:
+                        st.caption(f"({vs['緯度']:.5f}, {vs['経度']:.5f})")
+                    with col_del:
+                        if st.button("削除", key=f"del_vs_{i}"):
+                            st.session_state["virtual_stations"].pop(i)
+                            st.rerun()
 
         has_virtual = bool(st.session_state["virtual_stations"])
         stations_view = append_virtual_stations(stations, st.session_state["virtual_stations"])
