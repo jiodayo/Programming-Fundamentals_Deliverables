@@ -49,25 +49,32 @@ def learn_delay_patterns_from_incidents(
     df = df[(df['min_per_km'] > 0.5) & (df['min_per_km'] < 30)]
     
     # Hourly patterns
+    # 深夜は交通量が少ないので「最速」と仮定し、深夜の min_per_km を最小値として
+    # 他の時間帯がどれだけ遅くなるか（係数 > 1 = 遅い）を計算
     hourly_speed = df.groupby('hour')['min_per_km'].mean()
-    baseline_speed = hourly_speed.get(baseline_hour, hourly_speed.mean())
-    hourly_factors = (hourly_speed / baseline_speed).to_dict()
+    
+    # baseline_hour（深夜3時）の値を基準にするが、
+    # 救急車データでは深夜が遅くなる傾向があるため、
+    # 代わりに「最小値」を基準として、すべての時間帯が >= 1.0 になるようにする
+    min_speed = hourly_speed.min()  # 最も速い時間帯を基準
+    hourly_factors = (hourly_speed / min_speed).to_dict()
     
     # Day of week patterns
     dow_speed = df.groupby('dow')['min_per_km'].mean()
-    baseline_dow = dow_speed.mean()
-    dow_factors = (dow_speed / baseline_dow).to_dict()
+    min_dow_speed = dow_speed.min()  # 最も速い曜日を基準
+    dow_factors = (dow_speed / min_dow_speed).to_dict()
     
     # Hour x DOW matrix
     matrix_speed = df.groupby(['hour', 'dow'])['min_per_km'].mean().unstack()
-    baseline_matrix = matrix_speed.loc[baseline_hour].mean() if baseline_hour in matrix_speed.index else matrix_speed.values.mean()
+    # 最も速い時間帯x曜日の組み合わせを基準にする（すべて >= 1.0 になる）
+    min_matrix_val = np.nanmin(matrix_speed.values)
     matrix_factors = {}
     for hour in range(24):
         for dow in range(7):
             if hour in matrix_speed.index and dow in matrix_speed.columns:
                 val = matrix_speed.loc[hour, dow]
                 if pd.notna(val):
-                    matrix_factors[f"{hour}_{dow}"] = round(val / baseline_matrix, 3)
+                    matrix_factors[f"{hour}_{dow}"] = round(val / min_matrix_val, 3)
     
     # Round values
     hourly_factors = {k: round(v, 3) for k, v in hourly_factors.items()}
@@ -130,7 +137,8 @@ def main():
     
     # Display results
     print("\n" + "="*50)
-    print("📈 時間帯別 遅延係数（深夜3時=1.0基準）")
+    print("📈 時間帯別 遅延係数（最速時間帯=1.0基準）")
+    print("   ※係数が大きい = 混雑で遅い")
     print("="*50)
     for h in range(24):
         factor = patterns["hourly"].get(h, 1.0)

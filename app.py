@@ -542,15 +542,15 @@ def main() -> None:
 
                 delay_factor = get_delay_factor(selected_hour, selected_dow)
                 
-                # 係数の意味を表示
-                if delay_factor < 1.0:
+                # 係数の意味を表示（実データ: 日中が最速、深夜が遅い）
+                if delay_factor < 1.05:
                     emoji = "🟢"
-                    desc = "深夜より速い（救急優先走行の効果大）"
-                elif delay_factor < 1.1:
-                    desc = "通常"
+                    desc = "最速（日中帯）"
+                elif delay_factor < 1.2:
+                    desc = "やや遅い"
                     emoji = "🟡"
                 else:
-                    desc = "やや混雑"
+                    desc = "遅い（深夜帯）"
                     emoji = "🔴"
                 
                 st.info(f"{emoji} 遅延係数: **{delay_factor:.3f}** ({desc})")
