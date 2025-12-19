@@ -413,7 +413,7 @@ def main() -> None:
     if "virtual_stations" not in st.session_state:
         st.session_state["virtual_stations"] = []
 
-    tab_iso, tab_inc, tab_coverage = st.tabs(["到達圏", "出動地点 (R6)", "カバー率分析"])
+    tab_iso, tab_inc, tab_coverage, tab_resource = st.tabs(["到達圏", "出動地点 (R6)", "カバー率分析", "🚑 リソース分析"])
 
     with tab_iso:
         with st.expander("🗺️ 仮想消防署を追加（このセッションのみ）", expanded=False):
@@ -1303,6 +1303,114 @@ def main() -> None:
                     uncovered_display = uncovered[["date", "覚知", "出動場所", "出動隊"]].copy()
                     uncovered_display.columns = ["日付", "覚知時刻", "出動場所", "出動隊"]
                     st.dataframe(uncovered_display, use_container_width=True, hide_index=True)
+
+    # ========================================
+    # 🚑 リソース分析タブ
+    # ========================================
+    with tab_resource:
+        st.header("🚑 リソースベース カバレッジ分析")
+        st.markdown("""
+        各地点で「**n分以内に到達可能な救急車が何台あるか**」を分析し、
+        リソース配置の最適化提案を行います。
+        """)
+        
+        # キャッシュ確認
+        from misc.coverage_analysis import (
+            load_coverage_cache,
+            compute_coverage_quality,
+            compute_optimization_suggestions,
+            load_stations as load_stations_with_resources,
+            create_coverage_map,
+            STATION_RESOURCES,
+        )
+        
+        cache = load_coverage_cache()
+        
+        if cache is None:
+            st.warning("⚠️ カバレッジ分析のキャッシュがありません。")
+            st.code("python3 misc/coverage_analysis.py", language="bash")
+            st.info("上記コマンドを実行してカバレッジ分析を事前計算してください。")
+        else:
+            grid, travel_times = cache
+            
+            # 消防署データ（リソース情報付き）を読み込み
+            stations_res = load_stations_with_resources()
+            
+            # 閾値選択
+            threshold_min = st.selectbox(
+                "到達時間の閾値",
+                options=[5, 8, 10],
+                index=1,
+                format_func=lambda x: f"{x}分以内",
+            )
+            
+            # カバレッジ計算
+            grid = compute_coverage_quality(travel_times, grid, [5, 8, 10])
+            col = f"ambulances_{threshold_min}min"
+            
+            # 統計表示
+            st.subheader("📊 現状のカバレッジ状況")
+            
+            col1, col2, col3, col4 = st.columns(4)
+            total_points = len(grid)
+            zero_cov = (grid[col] == 0).sum()
+            single_cov = (grid[col] == 1).sum()
+            multi_cov = (grid[col] >= 2).sum()
+            
+            with col1:
+                st.metric("分析ポイント数", f"{total_points:,}")
+            with col2:
+                st.metric("カバレッジなし", f"{zero_cov:,}", delta=f"{zero_cov/total_points*100:.1f}%", delta_color="inverse")
+            with col3:
+                st.metric("1台のみ", f"{single_cov:,}", delta=f"{single_cov/total_points*100:.1f}%", delta_color="off")
+            with col4:
+                st.metric("2台以上", f"{multi_cov:,}", delta=f"{multi_cov/total_points*100:.1f}%", delta_color="normal")
+            
+            # リソース配置表示
+            st.subheader("🏥 消防署別リソース配置")
+            resource_df = stations_res[["略称", "救急車台数", "区分"]].copy()
+            resource_df.columns = ["消防署", "救急車台数", "区分"]
+            st.dataframe(resource_df, use_container_width=True, hide_index=True)
+            st.caption(f"合計: {stations_res['救急車台数'].sum()}台")
+            
+            # 最適化提案
+            st.subheader("💡 リソース配置 最適化提案")
+            suggestions = compute_optimization_suggestions(
+                grid, stations_res, travel_times, target_threshold_min=threshold_min
+            )
+            
+            # 弱点エリア
+            if suggestions["weak_areas"]:
+                st.markdown("**⚠️ 弱点エリア:**")
+                for area in suggestions["weak_areas"]:
+                    if area["severity"] == "高":
+                        st.error(f"🔴 {area['type']}: {area['count']}ポイント")
+                    else:
+                        st.warning(f"🟡 {area['type']}: {area['count']}ポイント")
+            
+            # 増強推奨
+            st.markdown("**📈 救急車1台追加時の改善効果（上位5署）:**")
+            for i, s in enumerate(suggestions["suggestions"], 1):
+                improvement_score = s["total_improvement"]
+                emoji = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "  "
+                st.markdown(
+                    f"{emoji} **{i}. {s['station_name']}** (現{s['current_ambulances']}台) "
+                    f"→ 新規カバー: {s['newly_covered_points']}pt, 冗長性追加: {s['redundancy_improved_points']}pt"
+                )
+            
+            # ヒートマップ表示
+            st.subheader("🗺️ カバレッジマップ")
+            st.markdown(f"**{threshold_min}分以内に到達可能な救急車台数**")
+            
+            with st.spinner("マップ生成中..."):
+                coverage_map = create_coverage_map(grid, stations_res, threshold_min)
+                st.components.v1.html(coverage_map.get_root().render(), height=600)
+            
+            st.markdown("---")
+            st.caption("""
+            **凡例**: 🔴 0台（カバレッジなし）, 🟠 1台（冗長性なし）, 🟡 2台, 🟢 3台以上  
+            **データソース**: R6出動データから各消防署の救急車台数を推定
+            """)
 
     st.info("アプリを終了するには、実行中のターミナルで Ctrl+C を押してください。")
 
