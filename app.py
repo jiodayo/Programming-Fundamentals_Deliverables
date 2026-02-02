@@ -11,6 +11,10 @@ import os
 from pathlib import Path
 from typing import Iterable, Callable
 import re
+import logging
+
+# WebSocketClosedErrorのログを抑制（Streamlit再描画時に発生する無害なエラー）
+logging.getLogger("tornado.application").setLevel(logging.CRITICAL)
 
 import folium
 import geopandas as gpd
@@ -31,6 +35,47 @@ from traffic_analysis import (
     DOW_LABELS,
     DELAY_FACTORS_PATH,
 )
+
+# リソース（救急車台数）情報 - R6（2024年）: R4〜R6で3隊増隊後
+STATION_RESOURCES_R6 = {
+    "東消防署": 4,
+    "中央消防署": 3,
+    "西消防署": 3,
+    "南消防署": 3,
+    "城北支署": 1,
+    "城東支署": 1,
+    "西部支署": 1,
+    "東部支署": 1,
+    "北条支署": 1,
+    "湯山出張所": 1,
+    "久谷出張所": 1,
+    "消防局": 1,
+    "WS": 1,
+}
+# 合計: 22台
+
+# リソース（救急車台数）情報 - H27（2015年）: 増隊前（推定）
+# R4〜R6で3隊増隊、H25時点ではWS常駐隊なし
+STATION_RESOURCES_H27_DEFAULT = {
+    "東消防署": 3,  # 推定
+    "中央消防署": 2,  # 推定
+    "西消防署": 2,  # 推定
+    "南消防署": 3,
+    "城北支署": 1,
+    "城東支署": 1,
+    "西部支署": 1,
+    "東部支署": 1,
+    "北条支署": 1,
+    "湯山出張所": 1,
+    "久谷出張所": 1,
+    "消防局": 1,
+    "WS": 0,  # H25時点では常駐隊なし
+}
+# 合計: 18台（R6より4台少ない・推定値）
+
+# 後方互換性のためのエイリアス
+STATION_RESOURCES = STATION_RESOURCES_R6
+DEFAULT_AMBULANCES = 1
 
 ox.settings.use_cache = True
 GRAPHML_PATH = Path("cache/matsuyama_drive.graphml")
@@ -929,7 +974,7 @@ def main() -> None:
 
     with tab_coverage:
         st.subheader("📊 出動地点の到達圏カバー率分析")
-        st.caption("配置変更前(H27)と変更後(R6)のカバー率を比較します。")
+        st.caption("現在の消防署配置でH27・R6の出動データを分析します。")
 
         # Check file availability
         r6_available = Path("R6.xlsx").exists()
@@ -942,13 +987,13 @@ def main() -> None:
         # Dataset selection
         dataset_options = []
         if r6_available:
-            dataset_options.append("R6 (配置変更後・2024年)")
+            dataset_options.append("R6 (2024年)")
         if h27_available:
-            dataset_options.append("H27 (配置変更前・2015年)")
+            dataset_options.append("H27 (2015年)")
         if r6_available and h27_available:
             dataset_options.append("⭐ 比較モード (R6 vs H27)")
 
-        col_mode, col_traffic = st.columns([2, 1])
+        col_mode, col_resource = st.columns([2, 1])
         with col_mode:
             selected_mode = st.radio(
                 "分析モード",
@@ -957,6 +1002,47 @@ def main() -> None:
             )
         
         is_comparison = "比較モード" in selected_mode
+
+        # ========== 🚑 リソース考慮オプション ==========
+        with col_resource:
+            resource_mode = st.checkbox(
+                "🚑 リソース考慮",
+                value=False,
+                help="各出動地点で到達可能な救急車台数を考慮したカバー率を計算します",
+            )
+        
+        if resource_mode:
+            st.info("""
+            **リソース考慮モード**: 単純な到達圏内/外ではなく、各出動地点に「何台の救急車が到達可能か」を分析します。
+            - 🟢 **2台以上**: 冗長性あり（1台出動中でも対応可能）
+            - 🟡 **1台のみ**: カバーされているが冗長性なし
+            - 🔴 **0台**: 到達圏外
+            """)
+            
+            # H27リソース設定の調整UI
+            with st.expander("⚙️ H27リソース設定を調整", expanded=False):
+                st.caption("H27当時の正確な配置が不明なため、手動で調整できます")
+                
+                h27_resources_custom = {}
+                cols_h27 = st.columns(3)
+                station_names = list(STATION_RESOURCES_H27_DEFAULT.keys())
+                for i, station in enumerate(station_names):
+                    default_val = STATION_RESOURCES_H27_DEFAULT[station]
+                    with cols_h27[i % 3]:
+                        h27_resources_custom[station] = st.number_input(
+                            station,
+                            min_value=0,
+                            max_value=10,
+                            value=default_val,
+                            key=f"h27_res_{station}"
+                        )
+                
+                total_h27 = sum(h27_resources_custom.values())
+                total_r6 = sum(STATION_RESOURCES_R6.values())
+                st.metric("H27 合計", f"{total_h27}台", delta=f"{total_h27 - total_r6}台 vs R6")
+                
+                # session_stateに保存
+                st.session_state["h27_resources_custom"] = h27_resources_custom
 
         # ========== 🚦 渋滞考慮 & 時間帯別分析 ==========
         with st.expander("🚦 時間帯別カバー率分析", expanded=False):
@@ -1051,10 +1137,28 @@ def main() -> None:
                     delay_factor=cov_delay_factor,
                 )
 
-        def analyze_coverage(incidents_df: pd.DataFrame, label: str, isochrones: gpd.GeoDataFrame = None) -> dict:
-            """Analyze coverage for a given incident dataset."""
+        def analyze_coverage(incidents_df: pd.DataFrame, label: str, isochrones: gpd.GeoDataFrame = None, with_resources: bool = False) -> dict:
+            """Analyze coverage for a given incident dataset.
+            
+            Args:
+                incidents_df: 出動データ
+                label: データラベル
+                isochrones: 到達圏データ
+                with_resources: リソース（救急車台数）を考慮するか
+            """
             if isochrones is None:
                 isochrones = isochrones_cov
+            
+            # データラベルに応じてリソース設定を選択
+            if "H27" in label or "2015" in label:
+                # カスタム設定があればそれを使用、なければデフォルト
+                station_resources = st.session_state.get("h27_resources_custom", STATION_RESOURCES_H27_DEFAULT)
+                total_amb = sum(station_resources.values())
+                resource_label = f"H27（推定{total_amb}台）"
+            else:
+                station_resources = STATION_RESOURCES_R6
+                total_amb = sum(station_resources.values())
+                resource_label = f"R6（{total_amb}台）"
             
             addr_series = incidents_df["出動場所"].dropna().astype(str)
             addr_unique = sorted(addr_series.unique())
@@ -1072,16 +1176,39 @@ def main() -> None:
                 crs="EPSG:4326"
             )
 
-            results = {"label": label, "total": len(incidents_df), "geocoded": len(mapped)}
+            results = {"label": label, "total": len(incidents_df), "geocoded": len(mapped), "resource_config": resource_label}
+            
             for minutes in trip_times_cov:
                 iso_layer = isochrones[isochrones["time"] == minutes]
                 if iso_layer.empty:
                     results[f"covered_{minutes}"] = 0
+                    if with_resources:
+                        incident_points[f"ambulances_{minutes}min"] = 0
                     continue
                 combined_polygon = unary_union(iso_layer.geometry)
                 within_mask = incident_points.geometry.within(combined_polygon)
                 results[f"covered_{minutes}"] = within_mask.sum()
                 incident_points[f"within_{minutes}min"] = within_mask
+                
+                # リソース考慮モード：各出動地点で到達可能な救急車台数を計算
+                if with_resources:
+                    ambulance_counts = []
+                    for idx, row in incident_points.iterrows():
+                        point = row.geometry
+                        count = 0
+                        # 各消防署の到達圏に含まれるか確認
+                        for _, iso_row in iso_layer.iterrows():
+                            station_name = iso_row["name"] if "name" in iso_row.index else ""
+                            if point.within(iso_row.geometry):
+                                # その署の救急車台数を加算（年度別リソース設定を使用）
+                                count += station_resources.get(station_name, DEFAULT_AMBULANCES)
+                        ambulance_counts.append(count)
+                    incident_points[f"ambulances_{minutes}min"] = ambulance_counts
+                    
+                    # リソース別カバー率
+                    results[f"covered_{minutes}_0amb"] = (incident_points[f"ambulances_{minutes}min"] == 0).sum()  # 圏外
+                    results[f"covered_{minutes}_1amb"] = (incident_points[f"ambulances_{minutes}min"] == 1).sum()  # 1台のみ
+                    results[f"covered_{minutes}_2amb"] = (incident_points[f"ambulances_{minutes}min"] >= 2).sum()  # 2台以上
 
             results["incident_points"] = incident_points
             results["mapped"] = mapped
@@ -1310,17 +1437,17 @@ def main() -> None:
             col_r6, col_h27 = st.columns(2)
 
             with col_r6:
-                st.markdown("### 🟢 R6 (配置変更後・2024年)")
+                st.markdown("### 🟢 R6 (2024年)")
             with col_h27:
-                st.markdown("### 🟡 H27 (配置変更前・2015年)")
+                st.markdown("### 🟡 H27 (2015年)")
 
             with st.spinner("R6データを分析中..."):
                 incidents_r6 = load_incident_data("R6.xlsx")
-                results_r6 = analyze_coverage(incidents_r6, "R6")
+                results_r6 = analyze_coverage(incidents_r6, "R6", with_resources=resource_mode)
 
             with st.spinner("H27データを分析中..."):
                 incidents_h27 = load_incident_data_h27("H27.xls")
-                results_h27 = analyze_coverage(incidents_h27, "H27")
+                results_h27 = analyze_coverage(incidents_h27, "H27", with_resources=resource_mode)
 
             if results_r6 is None or results_h27 is None:
                 st.error("データの分析に失敗しました。")
@@ -1348,9 +1475,74 @@ def main() -> None:
                     "差分": f"{diff:+.1f}%",
                 })
 
-            st.markdown("### 📊 カバー率比較")
+            st.markdown("### 📊 カバー率比較（到達圏内/外）")
             comparison_df = pd.DataFrame(comparison_data)
             st.dataframe(comparison_df, width="stretch", hide_index=True)
+
+            # ========== リソース考慮モードの追加表示 ==========
+            if resource_mode:
+                st.markdown("---")
+                st.markdown("### 🚑 リソース考慮カバー率比較")
+                st.caption("各出動地点に到達可能な救急車台数で分類")
+                
+                # 使用リソース設定を表示
+                st.info(f"""
+                **使用リソース設定**
+                - R6: {results_r6.get('resource_config', 'R6')}
+                - H27: {results_h27.get('resource_config', 'H27')}
+                """)
+                
+                resource_comparison = []
+                for minutes in trip_times_cov:
+                    r6_total = results_r6["geocoded"]
+                    h27_total = results_h27["geocoded"]
+                    
+                    # R6のリソース別カバー
+                    r6_0 = results_r6.get(f"covered_{minutes}_0amb", 0)
+                    r6_1 = results_r6.get(f"covered_{minutes}_1amb", 0)
+                    r6_2 = results_r6.get(f"covered_{minutes}_2amb", 0)
+                    
+                    # H27のリソース別カバー
+                    h27_0 = results_h27.get(f"covered_{minutes}_0amb", 0)
+                    h27_1 = results_h27.get(f"covered_{minutes}_1amb", 0)
+                    h27_2 = results_h27.get(f"covered_{minutes}_2amb", 0)
+                    
+                    resource_comparison.append({
+                        "到達時間": f"{minutes}分",
+                        "R6 🔴圏外": f"{r6_0} ({r6_0/r6_total*100:.1f}%)" if r6_total > 0 else "0",
+                        "R6 🟡1台": f"{r6_1} ({r6_1/r6_total*100:.1f}%)" if r6_total > 0 else "0",
+                        "R6 🟢2台+": f"{r6_2} ({r6_2/r6_total*100:.1f}%)" if r6_total > 0 else "0",
+                        "H27 🔴圏外": f"{h27_0} ({h27_0/h27_total*100:.1f}%)" if h27_total > 0 else "0",
+                        "H27 🟡1台": f"{h27_1} ({h27_1/h27_total*100:.1f}%)" if h27_total > 0 else "0",
+                        "H27 🟢2台+": f"{h27_2} ({h27_2/h27_total*100:.1f}%)" if h27_total > 0 else "0",
+                    })
+                
+                resource_df = pd.DataFrame(resource_comparison)
+                st.dataframe(resource_df, width="stretch", hide_index=True)
+                
+                # リソースメトリクス
+                st.markdown("### 📊 リソース冗長性の比較")
+                for minutes in trip_times_cov:
+                    r6_total = results_r6["geocoded"]
+                    h27_total = results_h27["geocoded"]
+                    
+                    r6_redundant = results_r6.get(f"covered_{minutes}_2amb", 0) / r6_total * 100 if r6_total > 0 else 0
+                    h27_redundant = results_h27.get(f"covered_{minutes}_2amb", 0) / h27_total * 100 if h27_total > 0 else 0
+                    diff_redundant = r6_redundant - h27_redundant
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric(f"R6 {minutes}分 冗長性あり", f"{r6_redundant:.1f}%")
+                    with col2:
+                        st.metric(f"H27 {minutes}分 冗長性あり", f"{h27_redundant:.1f}%")
+                    with col3:
+                        st.metric(
+                            f"{minutes}分 冗長性改善",
+                            f"{diff_redundant:+.1f}%",
+                            delta=f"{diff_redundant:+.1f}%" if diff_redundant != 0 else None,
+                            delta_color="normal" if diff_redundant >= 0 else "inverse"
+                        )
+            # ================================================
 
             # Metrics side by side
             st.markdown("### 📈 差分メトリクス")
@@ -1366,7 +1558,7 @@ def main() -> None:
                     st.metric(f"H27 {minutes}分到達圏", f"{h27_pct:.1f}%")
                 with col3:
                     st.metric(
-                        f"{minutes}分圏 改善度",
+                        f"{minutes}分圏 差分",
                         f"{diff:+.1f}%",
                         delta=f"{diff:+.1f}%" if diff != 0 else None,
                         delta_color="normal" if diff >= 0 else "inverse"
@@ -1380,15 +1572,23 @@ def main() -> None:
             r6_10min_pct = results_r6["covered_10"] / results_r6["geocoded"] * 100
             h27_10min_pct = results_h27["covered_10"] / results_h27["geocoded"] * 100
 
-            if r6_5min_pct > h27_5min_pct:
-                st.success(f"✅ 5分到達圏カバー率: 配置変更後 {r6_5min_pct - h27_5min_pct:+.1f}% 改善")
+            diff_5 = r6_5min_pct - h27_5min_pct
+            diff_10 = r6_10min_pct - h27_10min_pct
+            
+            st.markdown("""
+            **注意**: この比較は**現在の消防署配置**で両年度の出動データを分析したものです。
+            実際の配置変更（R4〜R6で3隊増隊）の効果を直接測定したものではありません。
+            """)
+            
+            if diff_5 > 0:
+                st.success(f"✅ 5分到達圏カバー率: R6がH27より {diff_5:+.1f}% 高い")
             else:
-                st.warning(f"⚠️ 5分到達圏カバー率: 配置変更後 {r6_5min_pct - h27_5min_pct:+.1f}%")
+                st.warning(f"⚠️ 5分到達圏カバー率: R6がH27より {diff_5:+.1f}%")
 
-            if r6_10min_pct > h27_10min_pct:
-                st.success(f"✅ 10分到達圏カバー率: 配置変更後 {r6_10min_pct - h27_10min_pct:+.1f}% 改善")
+            if diff_10 > 0:
+                st.success(f"✅ 10分到達圏カバー率: R6がH27より {diff_10:+.1f}% 高い")
             else:
-                st.warning(f"⚠️ 10分到達圏カバー率: 配置変更後 {r6_10min_pct - h27_10min_pct:+.1f}%")
+                st.warning(f"⚠️ 10分到達圏カバー率: R6がH27より {diff_10:+.1f}%")
 
             st.info(f"""
             **データ件数**
@@ -1409,7 +1609,7 @@ def main() -> None:
             st.write(f"全出動件数: {len(incidents_cov):,} 件")
 
             with st.spinner("住所をジオコーディング中..."):
-                results = analyze_coverage(incidents_cov, data_label)
+                results = analyze_coverage(incidents_cov, data_label, with_resources=resource_mode)
 
             if results is None:
                 st.error("出動地点をジオコーディングできませんでした。")
@@ -1451,6 +1651,57 @@ def main() -> None:
                             value=res["カバー率"],
                             delta=f"{res['カバー数']}/{res['全件数']}件"
                         )
+
+            # ========== リソース考慮モードの追加表示（単一データセット） ==========
+            if resource_mode:
+                st.markdown("---")
+                st.subheader("🚑 リソース考慮カバー率")
+                st.caption("各出動地点に到達可能な救急車台数で分類")
+                
+                # 使用リソース設定を表示
+                st.info(f"""
+                **使用リソース設定**: {results.get('resource_config', '')}
+                """)
+                
+                resource_results = []
+                for minutes in trip_times_cov:
+                    total = results["geocoded"]
+                    amb_0 = results.get(f"covered_{minutes}_0amb", 0)
+                    amb_1 = results.get(f"covered_{minutes}_1amb", 0)
+                    amb_2 = results.get(f"covered_{minutes}_2amb", 0)
+                    
+                    resource_results.append({
+                        "到達時間": f"{minutes}分",
+                        "🔴 圏外 (0台)": f"{amb_0} ({amb_0/total*100:.1f}%)" if total > 0 else "0",
+                        "🟡 1台のみ": f"{amb_1} ({amb_1/total*100:.1f}%)" if total > 0 else "0",
+                        "🟢 2台以上": f"{amb_2} ({amb_2/total*100:.1f}%)" if total > 0 else "0",
+                    })
+                
+                resource_df = pd.DataFrame(resource_results)
+                st.dataframe(resource_df, width="stretch", hide_index=True)
+                
+                # リソースメトリクス
+                for minutes in trip_times_cov:
+                    total = results["geocoded"]
+                    amb_0 = results.get(f"covered_{minutes}_0amb", 0)
+                    amb_1 = results.get(f"covered_{minutes}_1amb", 0)
+                    amb_2 = results.get(f"covered_{minutes}_2amb", 0)
+                    
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        st.metric(f"{minutes}分 圏外", f"{amb_0/total*100:.1f}%" if total > 0 else "0%", delta_color="inverse")
+                    with col2:
+                        st.metric(f"{minutes}分 1台カバー", f"{amb_1/total*100:.1f}%" if total > 0 else "0%")
+                    with col3:
+                        st.metric(f"{minutes}分 冗長性あり", f"{amb_2/total*100:.1f}%" if total > 0 else "0%")
+                
+                st.info("""
+                **リソース考慮の意味**:
+                - **圏外 (0台)**: 指定時間内に到達可能な救急車がない
+                - **1台のみ**: カバーされているが、その1台が出動中だと対応不可
+                - **2台以上**: 冗長性あり。1台が出動中でも別の車両で対応可能
+                """)
+            # ================================================
 
             # Render map with coverage visualization
             st.markdown("---")
