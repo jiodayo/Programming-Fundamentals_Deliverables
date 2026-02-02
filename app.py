@@ -413,7 +413,111 @@ def main() -> None:
     if "virtual_stations" not in st.session_state:
         st.session_state["virtual_stations"] = []
 
-    tab_iso, tab_inc, tab_coverage, tab_resource = st.tabs(["到達圏", "出動地点 (R6)", "カバー率分析", "🚑 リソース分析"])
+    tab_summary, tab_iso, tab_inc, tab_coverage, tab_resource, tab_optimize = st.tabs([
+        "📊 サマリー", "到達圏", "出動地点 (R6)", "カバー率分析", "🚑 リソース分析", "⭐ 配置最適化"
+    ])
+
+    # ========== タブ0: サマリー ==========
+    with tab_summary:
+        st.header("📊 松山市 救急搬送データ サマリー")
+        
+        # データ読み込み
+        @st.cache_data
+        def load_summary_data():
+            summary = {}
+            
+            # 消防署数
+            if os.path.exists("map.sqlite"):
+                conn = sqlite3.connect("map.sqlite")
+                stations = pd.read_sql_query("SELECT * FROM stations", conn)
+                conn.close()
+                summary["stations_count"] = len(stations)
+            else:
+                summary["stations_count"] = 0
+            
+            # R6出動データ
+            if os.path.exists("incidents.sqlite"):
+                conn = sqlite3.connect("incidents.sqlite")
+                try:
+                    r6_df = pd.read_sql_query("SELECT * FROM incidents_r6", conn)
+                    summary["r6_total"] = len(r6_df)
+                    if "出動日" in r6_df.columns:
+                        r6_df["出動日"] = pd.to_datetime(r6_df["出動日"], errors="coerce")
+                        summary["r6_days"] = r6_df["出動日"].nunique()
+                    else:
+                        summary["r6_days"] = 0
+                except:
+                    summary["r6_total"] = 0
+                    summary["r6_days"] = 0
+                
+                try:
+                    h27_df = pd.read_sql_query("SELECT * FROM incidents_h27", conn)
+                    summary["h27_total"] = len(h27_df)
+                except:
+                    summary["h27_total"] = 0
+                conn.close()
+            else:
+                summary["r6_total"] = 0
+                summary["h27_total"] = 0
+                summary["r6_days"] = 0
+            
+            # ジオコーディング済みデータ
+            if os.path.exists("cache/incident_geocode.parquet"):
+                geo_df = pd.read_parquet("cache/incident_geocode.parquet")
+                summary["geocoded"] = len(geo_df)
+            else:
+                summary["geocoded"] = 0
+            
+            return summary
+        
+        summary = load_summary_data()
+        
+        # メトリクスカード
+        st.markdown("### 📈 基本統計")
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric("🏢 消防署数", f"{summary['stations_count']} 署")
+        with col2:
+            st.metric("🚑 R6 出動件数", f"{summary['r6_total']:,} 件")
+        with col3:
+            st.metric("📅 R6 データ日数", f"{summary['r6_days']} 日")
+        with col4:
+            st.metric("📍 位置特定済み", f"{summary['geocoded']:,} 件")
+        
+        st.markdown("---")
+        
+        # 比較
+        st.markdown("### 📊 年度別比較")
+        col_comp1, col_comp2, col_comp3 = st.columns(3)
+        
+        with col_comp1:
+            st.metric("H27 (2015年)", f"{summary['h27_total']:,} 件")
+        with col_comp2:
+            st.metric("R6 (2024年)", f"{summary['r6_total']:,} 件")
+        with col_comp3:
+            if summary['h27_total'] > 0:
+                change = summary['r6_total'] - summary['h27_total']
+                change_pct = (change / summary['h27_total']) * 100
+                st.metric("変化", f"{change:+,} 件", delta=f"{change_pct:+.1f}%")
+            else:
+                st.metric("変化", "N/A")
+        
+        st.markdown("---")
+        
+        # クイックリンク
+        st.markdown("### 🔗 各機能へ")
+        st.markdown("""
+        | タブ | 説明 |
+        |------|------|
+        | **到達圏** | 消防署からの5/10/15/20分到達圏を表示。仮想消防署の追加も可能 |
+        | **出動地点 (R6)** | 日別の出動地点をプロット。🎬 アニメーション表示対応 |
+        | **カバー率分析** | H27とR6のカバー率を比較。改善度を数値で確認 |
+        | **リソース分析** | 各消防署のリソース（救急車台数）を分析 |
+        | **配置最適化** | 新規消防署の最適配置をシミュレーション |
+        """)
+        
+        st.info("💡 各タブをクリックして詳細な分析を行ってください")
 
     with tab_iso:
         with st.expander("🗺️ 仮想消防署を追加（このセッションのみ）", expanded=False):
@@ -614,6 +718,8 @@ def main() -> None:
         st.components.v1.html(html_map, height=720)
 
     with tab_inc:
+        st.subheader("🗓️ 出動地点プロット")
+        
         try:
             incidents = load_incident_data("R6.xlsx")
         except FileNotFoundError:
@@ -625,13 +731,23 @@ def main() -> None:
             st.warning("R6.xlsx に日付データがありません。")
             st.stop()
 
-        default_date = date_options[0]
-        selected_date = st.selectbox(
-            "表示する日付 (覚知日)",
-            options=date_options,
-            format_func=lambda d: d.strftime("%Y-%m-%d"),
-            index=0,
-        )
+        # 日付選択
+        col_date, col_mode = st.columns([2, 1])
+        with col_date:
+            default_date = date_options[0]
+            selected_date = st.selectbox(
+                "表示する日付 (覚知日)",
+                options=date_options,
+                format_func=lambda d: d.strftime("%Y-%m-%d"),
+                index=0,
+            )
+        with col_mode:
+            display_mode = st.radio(
+                "表示モード",
+                ["📍 静的表示", "🎬 アニメーション"],
+                horizontal=True,
+                help="アニメーションでは時系列で出動を再生できます"
+            )
 
         day_inc = incidents[incidents["date"] == selected_date].copy()
         addr_series = day_inc["出動場所"].dropna().astype(str)
@@ -652,11 +768,7 @@ def main() -> None:
 
         st.write(f"地図にプロットできた件数: {len(mapped)} / {len(day_inc)} (未特定 {missing_count} 件)")
 
-        center_lat = mapped["lat"].mean()
-        center_lon = mapped["lon"].mean()
-        fmap = folium.Map(location=[center_lat, center_lon], zoom_start=12, tiles="CartoDB Positron")
-
-        # Softer color by weekday to help visually group clusters
+        # 曜日別カラーマップ
         weekday_colors = {
             "月": "#f94144",
             "火": "#f3722c",
@@ -667,23 +779,153 @@ def main() -> None:
             "日": "#9d4edd",
         }
 
-        for _, row in mapped.iterrows():
-            wk = str(row.get("曜日", "?"))
-            color = weekday_colors.get(wk, "#4a4a4a")
-            label_time = row["覚知"].strftime("%H:%M") if not pd.isna(row.get("覚知")) else "--:--"
-            popup = f"{row.get('出動隊', '不明')} | {label_time} | {row.get('搬送区分(事案)', '')}"
-            folium.CircleMarker(
-                location=[row["lat"], row["lon"]],
-                radius=5,
-                color=color,
-                fill=True,
-                fill_color=color,
-                fill_opacity=0.85,
-                weight=1.0,
-                popup=popup,
-            ).add_to(fmap)
+        center_lat = mapped["lat"].mean()
+        center_lon = mapped["lon"].mean()
 
-        st.components.v1.html(fmap.get_root().render(), height=720)
+        if display_mode == "📍 静的表示":
+            # 従来の静的表示
+            fmap = folium.Map(location=[center_lat, center_lon], zoom_start=12, tiles="CartoDB Positron")
+
+            for _, row in mapped.iterrows():
+                wk = str(row.get("曜日", "?"))
+                color = weekday_colors.get(wk, "#4a4a4a")
+                label_time = row["覚知"].strftime("%H:%M") if not pd.isna(row.get("覚知")) else "--:--"
+                popup = f"{row.get('出動隊', '不明')} | {label_time} | {row.get('搬送区分(事案)', '')}"
+                folium.CircleMarker(
+                    location=[row["lat"], row["lon"]],
+                    radius=5,
+                    color=color,
+                    fill=True,
+                    fill_color=color,
+                    fill_opacity=0.85,
+                    weight=1.0,
+                    popup=popup,
+                ).add_to(fmap)
+
+            st.components.v1.html(fmap.get_root().render(), height=720)
+
+        else:
+            # 🎬 アニメーション表示
+            st.markdown("---")
+            st.markdown("### 🎬 出動アニメーション設定")
+            
+            col_anim1, col_anim2, col_anim3 = st.columns(3)
+            with col_anim1:
+                period_min = st.slider(
+                    "再生ステップ (分)",
+                    min_value=5,
+                    max_value=60,
+                    value=15,
+                    step=5,
+                    help="タイムラインの1ステップあたりの時間"
+                )
+            with col_anim2:
+                duration_min = st.slider(
+                    "ポイント表示時間 (分)",
+                    min_value=30,
+                    max_value=180,
+                    value=60,
+                    step=30,
+                    help="出動地点が地図上に表示され続ける時間"
+                )
+            with col_anim3:
+                auto_play = st.checkbox("自動再生", value=False)
+            
+            # GeoJSON FeatureCollection を生成
+            from folium.plugins import TimestampedGeoJson
+            
+            # 時刻でソート
+            mapped_sorted = mapped.sort_values("覚知")
+            
+            features = []
+            for _, row in mapped_sorted.iterrows():
+                if pd.isna(row.get("覚知")):
+                    continue
+                
+                wk = str(row.get("曜日", "?"))
+                color = weekday_colors.get(wk, "#4a4a4a")
+                
+                # ISO8601形式の時刻
+                time_str = row["覚知"].strftime("%Y-%m-%dT%H:%M:%S")
+                
+                label_time = row["覚知"].strftime("%H:%M")
+                popup_text = f"{row.get('出動隊', '不明')} | {label_time} | {row.get('搬送区分(事案)', '')}"
+                
+                feature = {
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [row["lon"], row["lat"]],  # GeoJSON: [lon, lat]
+                    },
+                    "properties": {
+                        "time": time_str,
+                        "popup": popup_text,
+                        "icon": "circle",
+                        "iconstyle": {
+                            "fillColor": color,
+                            "fillOpacity": 0.8,
+                            "stroke": "true",
+                            "color": color,
+                            "radius": 8,
+                        },
+                    },
+                }
+                features.append(feature)
+            
+            geojson_data = {
+                "type": "FeatureCollection",
+                "features": features,
+            }
+            
+            # 地図生成
+            fmap_anim = folium.Map(
+                location=[center_lat, center_lon],
+                zoom_start=12,
+                tiles="CartoDB Positron"
+            )
+            
+            # TimestampedGeoJson追加
+            TimestampedGeoJson(
+                geojson_data,
+                period=f"PT{period_min}M",
+                duration=f"PT{duration_min}M",
+                auto_play=auto_play,
+                loop=True,
+                loop_button=True,
+                date_options="HH:mm",
+                time_slider_drag_update=True,
+            ).add_to(fmap_anim)
+            
+            # 消防署も表示
+            for _, station in stations.iterrows():
+                folium.Marker(
+                    location=[station["緯度"], station["経度"]],
+                    popup=f"🏥 {station['略称']}",
+                    icon=folium.Icon(color="blue", icon="plus", prefix="fa"),
+                ).add_to(fmap_anim)
+            
+            st.components.v1.html(fmap_anim.get_root().render(), height=720)
+            
+            st.caption("""
+            **操作方法**: 
+            - ▶️ 再生ボタンでアニメーション開始
+            - スライダーをドラッグして時刻を移動
+            - 出動地点は時間経過で出現・消滅します
+            """)
+            
+            # 時間帯別の出動件数サマリ
+            with st.expander("📊 時間帯別 出動件数", expanded=False):
+                mapped_sorted["hour"] = pd.to_datetime(mapped_sorted["覚知"]).dt.hour
+                hourly_counts = mapped_sorted.groupby("hour").size().reset_index(name="件数")
+                hourly_counts.columns = ["時", "件数"]
+                
+                import altair as alt
+                chart = alt.Chart(hourly_counts).mark_bar(color="#f94144").encode(
+                    x=alt.X("時:O", title="時刻"),
+                    y=alt.Y("件数:Q", title="出動件数"),
+                    tooltip=["時", "件数"],
+                ).properties(width=600, height=200)
+                st.altair_chart(chart, width="stretch")
 
     with tab_coverage:
         st.subheader("📊 出動地点の到達圏カバー率分析")
@@ -931,14 +1173,14 @@ def main() -> None:
                         display_df_r6 = hourly_df_r6[["時間帯", "件数", "5分圏率", "10分圏率"]].copy()
                         display_df_r6["5分圏率"] = display_df_r6["5分圏率"].apply(lambda x: f"{x:.1f}%")
                         display_df_r6["10分圏率"] = display_df_r6["10分圏率"].apply(lambda x: f"{x:.1f}%")
-                        st.dataframe(display_df_r6, use_container_width=True, hide_index=True)
+                        st.dataframe(display_df_r6, width="stretch", hide_index=True)
                     
                     with col_h27_h:
                         st.markdown("### 🟡 H27 (2015年)")
                         display_df_h27 = hourly_df_h27[["時間帯", "件数", "5分圏率", "10分圏率"]].copy()
                         display_df_h27["5分圏率"] = display_df_h27["5分圏率"].apply(lambda x: f"{x:.1f}%")
                         display_df_h27["10分圏率"] = display_df_h27["10分圏率"].apply(lambda x: f"{x:.1f}%")
-                        st.dataframe(display_df_h27, use_container_width=True, hide_index=True)
+                        st.dataframe(display_df_h27, width="stretch", hide_index=True)
                     
                     # 比較グラフ（5分圏）
                     st.markdown("### 📈 5分圏カバー率比較グラフ")
@@ -961,7 +1203,7 @@ def main() -> None:
                         width=600,
                         height=350,
                     )
-                    st.altair_chart(chart_5min, use_container_width=True)
+                    st.altair_chart(chart_5min, width="stretch")
                     
                     # 差分テーブル
                     st.markdown("### 📊 時間帯別 改善度（R6 - H27）")
@@ -979,7 +1221,7 @@ def main() -> None:
                             })
                     
                     diff_df = pd.DataFrame(diff_data)
-                    st.dataframe(diff_df, use_container_width=True, hide_index=True)
+                    st.dataframe(diff_df, width="stretch", hide_index=True)
                     
                     # サマリ
                     st.markdown("### 🔍 分析サマリ")
@@ -1017,7 +1259,7 @@ def main() -> None:
                     display_df = hourly_df.copy()
                     display_df["5分圏率"] = display_df["5分圏率"].apply(lambda x: f"{x:.1f}%")
                     display_df["10分圏率"] = display_df["10分圏率"].apply(lambda x: f"{x:.1f}%")
-                    st.dataframe(display_df, use_container_width=True, hide_index=True)
+                    st.dataframe(display_df, width="stretch", hide_index=True)
                     
                     # グラフ表示
                     st.markdown("### 📈 時間帯別カバー率グラフ")
@@ -1042,7 +1284,7 @@ def main() -> None:
                         width=600,
                         height=400,
                     )
-                    st.altair_chart(chart, use_container_width=True)
+                    st.altair_chart(chart, width="stretch")
                     
                     # 時間帯間の差を分析
                     st.markdown("### 🔍 分析サマリ")
@@ -1108,7 +1350,7 @@ def main() -> None:
 
             st.markdown("### 📊 カバー率比較")
             comparison_df = pd.DataFrame(comparison_data)
-            st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+            st.dataframe(comparison_df, width="stretch", hide_index=True)
 
             # Metrics side by side
             st.markdown("### 📈 差分メトリクス")
@@ -1198,7 +1440,7 @@ def main() -> None:
 
             if coverage_results:
                 coverage_df = pd.DataFrame(coverage_results)
-                st.dataframe(coverage_df, use_container_width=True, hide_index=True)
+                st.dataframe(coverage_df, width="stretch", hide_index=True)
 
                 # Show metrics
                 cols = st.columns(len(coverage_results))
@@ -1302,7 +1544,7 @@ def main() -> None:
                     st.subheader(f"⚠️ 10分到達圏外の出動 ({len(uncovered)} 件)")
                     uncovered_display = uncovered[["date", "覚知", "出動場所", "出動隊"]].copy()
                     uncovered_display.columns = ["日付", "覚知時刻", "出動場所", "出動隊"]
-                    st.dataframe(uncovered_display, use_container_width=True, hide_index=True)
+                    st.dataframe(uncovered_display, width="stretch", hide_index=True)
 
     # ========================================
     # 🚑 リソース分析タブ
@@ -1327,9 +1569,9 @@ def main() -> None:
         cache = load_coverage_cache()
         
         if cache is None:
-            st.warning("⚠️ カバレッジ分析のキャッシュがありません。")
+            st.warning("⚠️ カバレッジ分析のキャッシュがないか、読み込みに失敗しました（NumPyバージョン不整合の可能性）。")
             st.code("python3 misc/coverage_analysis.py", language="bash")
-            st.info("上記コマンドを実行してカバレッジ分析を事前計算してください。")
+            st.info("上記コマンドを実行してカバレッジ分析を事前計算（または再生成）してください。")
         else:
             grid, travel_times = cache
             
@@ -1370,7 +1612,7 @@ def main() -> None:
             st.subheader("🏥 消防署別リソース配置")
             resource_df = stations_res[["略称", "救急車台数", "区分"]].copy()
             resource_df.columns = ["消防署", "救急車台数", "区分"]
-            st.dataframe(resource_df, use_container_width=True, hide_index=True)
+            st.dataframe(resource_df, width="stretch", hide_index=True)
             st.caption(f"合計: {stations_res['救急車台数'].sum()}台")
             
             # 最適化提案
@@ -1411,6 +1653,241 @@ def main() -> None:
             **凡例**: 🔴 0台（カバレッジなし）, 🟠 1台（冗長性なし）, 🟡 2台, 🟢 3台以上  
             **データソース**: R6出動データから各消防署の救急車台数を推定
             """)
+
+    # ========================================
+    # ⭐ 配置最適化タブ
+    # ========================================
+    with tab_optimize:
+        st.header("⭐ リソース考慮 配置最適化")
+        st.markdown("""
+        出動データと既存リソースを分析し、**新規消防署の最適な候補地点**を自動で提案します。
+        
+        **特徴:**
+        - 📍 出動密度とカバレッジギャップから候補地点を自動抽出
+        - 🚑 既存の救急車配置を考慮したシミュレーション
+        - ⚡ 高速な貪欲法アルゴリズム（デモ向け）
+        """)
+        
+        # インポート（遅延読み込み）
+        try:
+            from optimization import (
+                load_stations as opt_load_stations,
+                load_incident_locations,
+                generate_candidate_locations,
+                optimize_placement,
+                create_optimization_map,
+                CandidateLocation,
+                load_candidates_cache,
+                save_candidates_cache,
+            )
+            optimization_available = True
+        except ImportError as e:
+            optimization_available = False
+            st.error(f"最適化モジュールの読み込みに失敗しました: {e}")
+        
+        if optimization_available:
+            # 設定
+            st.subheader("⚙️ 最適化設定")
+            
+            col_set1, col_set2, col_set3 = st.columns(3)
+            with col_set1:
+                n_candidates = st.slider(
+                    "候補地点数",
+                    min_value=5,
+                    max_value=20,
+                    value=10,
+                    help="生成する候補地点の数。多いほど精度が上がりますが計算時間が増えます。"
+                )
+            with col_set2:
+                threshold_min_opt = st.selectbox(
+                    "到達時間の閾値",
+                    options=[5, 8, 10],
+                    index=1,
+                    format_func=lambda x: f"{x}分以内",
+                    help="この時間内に到達できることを目標とします。"
+                )
+            with col_set3:
+                new_ambulances = st.number_input(
+                    "新規消防署の救急車台数",
+                    min_value=1,
+                    max_value=5,
+                    value=2,
+                    help="新しく設置する消防署に配備する救急車の台数。"
+                )
+            
+            use_cache = st.checkbox("キャッシュを使用（高速化）", value=True, help="以前の計算結果を再利用します。")
+            
+            # 実行ボタン
+            st.markdown("---")
+            col_btn1, col_btn2 = st.columns([1, 3])
+            with col_btn1:
+                run_optimization = st.button("🚀 最適化を実行", type="primary")
+            with col_btn2:
+                if st.button("🗑️ キャッシュクリア", type="secondary"):
+                    from optimization import OPTIMIZATION_CACHE_PATH
+                    if OPTIMIZATION_CACHE_PATH.exists():
+                        OPTIMIZATION_CACHE_PATH.unlink()
+                        st.success("キャッシュをクリアしました。")
+                        st.rerun()
+            
+            if run_optimization:
+                st.markdown("---")
+                
+                # データ読み込み
+                with st.spinner("データを読み込み中..."):
+                    stations_opt = opt_load_stations()
+                    incidents_opt = load_incident_locations()
+                
+                if incidents_opt.empty:
+                    st.error("出動データが見つかりません。先にジオコーディングを実行してください。")
+                    st.code("python scripts/precompute_incident_geocode.py", language="bash")
+                    st.stop()
+                
+                st.info(f"📊 分析対象: 消防署 {len(stations_opt)}箇所, 出動地点 {len(incidents_opt):,}件")
+                
+                # 候補地点生成
+                st.subheader("📍 候補地点の抽出")
+                
+                candidates = None
+                if use_cache:
+                    candidates = load_candidates_cache()
+                    if candidates:
+                        st.success(f"✅ キャッシュから{len(candidates)}候補を読み込みました")
+                
+                if candidates is None:
+                    with st.spinner("候補地点を生成中..."):
+                        prog_cand = st.progress(0)
+                        candidates = generate_candidate_locations(
+                            stations_opt, incidents_opt,
+                            n_candidates=n_candidates,
+                            progress_cb=lambda p: prog_cand.progress(int(p * 100)),
+                        )
+                        save_candidates_cache(candidates)
+                        st.success(f"✅ {len(candidates)}候補地点を生成しました")
+                
+                # 候補一覧表示
+                if candidates:
+                    candidate_data = []
+                    for i, c in enumerate(candidates, 1):
+                        candidate_data.append({
+                            "順位": i,
+                            "緯度": f"{c.lat:.5f}",
+                            "経度": f"{c.lon:.5f}",
+                            "理由": c.reason,
+                            "出動密度": f"{c.incident_density:.2f}",
+                            "ギャップ": f"{c.current_coverage_gap:.2f}",
+                            "スコア": f"{c.priority_score:.3f}",
+                        })
+                    
+                    with st.expander(f"📋 候補地点一覧（{len(candidates)}件）", expanded=False):
+                        st.dataframe(pd.DataFrame(candidate_data), width="stretch", hide_index=True)
+                
+                # 最適化実行
+                st.subheader("🎯 最適化シミュレーション")
+                
+                with st.spinner("シミュレーション実行中..."):
+                    prog_opt = st.progress(0)
+                    result = optimize_placement(
+                        stations_opt, incidents_opt, candidates,
+                        threshold_min=threshold_min_opt,
+                        new_ambulances=new_ambulances,
+                        progress_cb=lambda p: prog_opt.progress(int(p * 100)),
+                    )
+                
+                st.success(f"✅ 最適化完了（{result.computation_time_sec:.2f}秒）")
+                
+                # 結果表示
+                st.markdown("---")
+                st.subheader("⭐ 最適化結果")
+                
+                if result.best_location:
+                    col_res1, col_res2 = st.columns([1, 1])
+                    
+                    with col_res1:
+                        st.markdown("### 🏆 最適候補地点")
+                        st.markdown(f"""
+                        - **位置**: ({result.best_location['lat']:.5f}, {result.best_location['lon']:.5f})
+                        - **選定理由**: {result.best_location['reason']}
+                        - **新規カバー件数**: {result.best_location['newly_covered_incidents']:,}件
+                        - **効率スコア**: {result.best_location['efficiency_score']:.1f}件/台
+                        """)
+                        
+                        # Google Maps リンク
+                        gmap_url = f"https://www.google.com/maps?q={result.best_location['lat']},{result.best_location['lon']}"
+                        st.markdown(f"[📍 Google Mapsで開く]({gmap_url})")
+                    
+                    with col_res2:
+                        st.markdown("### 📈 改善効果")
+                        st.metric(
+                            "新規カバー件数",
+                            f"{result.best_location['newly_covered_incidents']:,}件",
+                            delta=f"+{result.best_location['efficiency_score']:.1f}件/救急車1台"
+                        )
+                        st.metric(
+                            "投入リソース",
+                            f"救急車 {new_ambulances}台",
+                        )
+                        st.info(f"""
+                        **リソース効率**: 救急車1台あたり約{result.best_location['efficiency_score']:.0f}件の
+                        出動をカバー可能になります。
+                        """)
+                
+                else:
+                    st.warning("最適な候補地点を特定できませんでした。")
+                
+                # マップ表示
+                st.subheader("🗺️ 最適化結果マップ")
+                
+                with st.spinner("マップ生成中..."):
+                    opt_map = create_optimization_map(
+                        stations_opt, incidents_opt, candidates, result.best_location
+                    )
+                    st.components.v1.html(opt_map.get_root().render(), height=600)
+                
+                st.caption("""
+                **凡例**: 📍青=既存消防署, ⭐赤=最適候補地点, ●橙=その他候補, ・灰=出動地点  
+                **赤い円**: 8分到達圏（概算）
+                """)
+                
+                # 詳細結果
+                with st.expander("📊 詳細分析データ", expanded=False):
+                    st.markdown("**カバレッジ改善:**")
+                    st.json(result.coverage_improvement)
+                    
+                    st.markdown("**リソース効率:**")
+                    st.json(result.resource_efficiency)
+                    
+                    st.markdown("**全候補地点スコア:**")
+                    all_candidates_df = pd.DataFrame(result.candidate_locations)
+                    st.dataframe(all_candidates_df, width="stretch")
+            
+            else:
+                # 実行前の説明
+                st.markdown("---")
+                st.info("""
+                **使い方:**
+                1. 上記の設定を調整（デフォルトでもOK）
+                2. 「🚀 最適化を実行」ボタンをクリック
+                3. 候補地点の生成 → シミュレーション → 結果表示
+                
+                **所要時間**: 約10〜30秒（キャッシュ使用時は数秒）
+                """)
+                
+                # 現在のリソース配置を表示
+                st.subheader("📊 現在のリソース配置")
+                try:
+                    stations_preview = opt_load_stations()
+                    preview_df = stations_preview[["略称", "救急車台数", "区分"]].copy()
+                    preview_df.columns = ["消防署", "救急車台数", "区分"]
+                    
+                    col_p1, col_p2 = st.columns([2, 1])
+                    with col_p1:
+                        st.dataframe(preview_df, width="stretch", hide_index=True)
+                    with col_p2:
+                        st.metric("総救急車台数", f"{preview_df['救急車台数'].sum()}台")
+                        st.metric("消防署数", f"{len(preview_df)}箇所")
+                except Exception as e:
+                    st.warning(f"プレビュー表示に失敗: {e}")
 
     st.info("アプリを終了するには、実行中のターミナルで Ctrl+C を押してください。")
 

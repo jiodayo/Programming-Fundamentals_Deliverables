@@ -19,6 +19,7 @@ import networkx as nx
 import numpy as np
 import osmnx as ox
 import pandas as pd
+import folium
 from shapely.geometry import Point, box
 
 # 各消防署の救急車台数（R6データから）
@@ -289,9 +290,18 @@ def load_coverage_cache(
     times_path = CACHE_DIR / f"{cache_name}_times.pkl"
     
     if grid_path.exists() and times_path.exists():
-        grid = pd.read_pickle(grid_path)
-        travel_times = pd.read_pickle(times_path)
-        return grid, travel_times
+        try:
+            grid = pd.read_pickle(grid_path)
+            travel_times = pd.read_pickle(times_path)
+            return grid, travel_times
+        except (ModuleNotFoundError, ImportError, pickle.UnpicklingError) as e:
+            # NumPyバージョン不整合などでpickle読み込み失敗
+            print(f"⚠️ キャッシュ読み込みエラー（バージョン不整合の可能性）: {e}")
+            print("  → キャッシュを再生成してください: python3 misc/coverage_analysis.py")
+            return None
+        except Exception as e:
+            print(f"⚠️ キャッシュ読み込みエラー: {e}")
+            return None
     return None
 
 
